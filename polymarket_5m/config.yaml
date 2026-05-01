@@ -1,0 +1,221 @@
+# config.yaml — Semua parameter sistem
+
+project:
+  name: "polymarket_btc_15m"
+  symbol: "BTCUSDT"
+  round_minutes: 15          # Durasi round Polymarket (15 menit)
+  target_threshold: 0.0003   # 0.03% minimum move untuk label valid (bukan 0.0)
+                             # Alasan: round dengan return < 0.03% sangat noise
+                             # Tuning range: 0.0001 - 0.0010
+  version: "v1"
+
+paths:
+  data:
+    raw: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/raw"
+    orderbook: "data/raw/orderbook"
+    aggtrades: "data/raw/aggtrades"
+    klines_1m: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/raw/historical_1m_klines.parquet"
+    interim: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/interim"
+    features_v1: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/features/v1"
+    labels: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/labels"
+  models:
+    artifacts: "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts"
+    checkpoints: "models/checkpoints"
+  logs: "logs"
+  reports: "reports"
+
+data:
+  ob_depth: 20               # Top 20 level bid/ask (data yang ada)
+  pre_round_window_mins: 15  # Window fitur sebelum round T
+  max_gap_seconds: 180       # Gap data maks dalam window (3 menit)
+  min_ticks_per_round: 10    # Minimum tick per round agar valid
+  resample_interval_seconds: 10  # Resample OB ke 10 detik
+  coverage_warning_threshold: 0.70  # Warning jika coverage < 70%
+  # Data range yang tersedia
+  data_start: "2025-04-29"
+  data_end: "2026-04-16"
+
+features:
+  # Kolom TIME yang TIDAK boleh diagregasi (hanya snapshot)
+  time_like_cols:
+    - "sin_hour"
+    - "cos_hour"
+    - "sin_dow"
+    - "cos_dow"
+    - "sin_15m"
+    - "cos_15m"
+    - "is_us_session"
+    - "is_london_session"
+    - "is_overlap"
+    - "is_weekend"
+    - "is_roll_hour"
+    - "minutes_since_roll"
+
+  # Kolom yang mengandung harga absolut (DILARANG masuk feature)
+  price_absolute_cols:
+    - "price"
+    - "close"
+    - "open"
+    - "high"
+    - "low"
+    - "initial_price"
+    - "final_price"
+
+  # Kolom target dan metadata (DILARANG masuk feature)
+  exclude_cols:
+    - "round_start"
+    - "target"
+    - "future_return"
+    - "tick_count"
+    - "max_gap"
+    - "gap_to_prev"
+    - "has_valid_context"
+    - "round_label"
+    - "label_source"
+    - "label_threshold"
+    - "label_version"
+    - "volume_sum"
+    - "initial_price"
+    - "final_price"
+
+  target_n_features: 70       # Setelah feature reduction via LightGBM
+  nan_threshold: 0.30         # Buang feature jika NaN > 30%
+  std_threshold: 1.0e-10      # Buang feature jika std ≈ 0 (konstan)
+
+  inter_round_lags: 8         # Berapa lag round ke belakang
+  inter_round_rolling: [4, 8, 16]  # Window untuk rolling stats antar-round
+
+training:
+  # Split ratios
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+  # Sample weights
+  # PELAJARAN: 3.5x terlalu agresif → LightGBM "No further splits"
+  # Tuned ke 2.0x berdasarkan observasi
+  sample_weight_high: 2.0    # Untuk round dengan |return| >= median
+  sample_weight_low: 1.0     # Untuk round dengan |return| < median
+
+  # Walk-forward validation
+  wfv_train_rounds: 1344     # ~14 hari × 96 rounds/hari
+  wfv_val_rounds: 192        # ~2 hari × 96 rounds/hari
+  wfv_step_rounds: 192       # Geser 2 hari per fold
+  wfv_n_splits: 6            # Minimum 6 fold
+
+  catboost:
+    # RTX 3050 4GB CONSTRAINTS (TIDAK BOLEH DIUBAH)
+    task_type: "GPU"
+    devices: "0"
+    gpu_ram_part: 0.40        # MAKSIMUM. Jangan naikkan.
+    max_bin: 128              # MAKSIMUM. Jangan naikkan.
+    bootstrap_type: "Bernoulli"  # WAJIB (bukan Bayesian)
+    loss_function: "Logloss"
+    eval_metric: "AUC"
+    random_seed: 42
+    # rsm: TIDAK ADA DI SINI — tidak didukung GPU + Logloss
+    # Parameter yang di-tune via Optuna:
+    optuna_search_space:
+      depth: [3, 5]            # DIKECILKAN (sebelumnya 4-7) untuk mencegah kompleksitas berlebih
+      l2_leaf_reg: [50, 500]   # DINAIKKAN drastis (sebelumnya 5-150) untuk regularisasi kuat
+      random_strength: [1.0, 20.0]
+      min_data_in_leaf: [200, 1500] # DINAIKKAN (sebelumnya 50-600) agar leaf lebih stabil
+      learning_rate: [0.001, 0.02]  # DIPERLAMBAT (sebelumnya 0.003-0.05)
+      max_bin: [48, 128]
+      subsample: [0.5, 0.85]   # DIPERKETAT (sebelumnya 0.6-0.95) untuk bagging lebih agresif
+    # Fixed per trial
+    iterations_per_trial: 3000
+    early_stopping_per_trial: 150
+    # Final training
+    iterations_final: 10000
+    early_stopping_final: 500
+    snapshot_interval: 300    # seconds
+
+  lightgbm_screener:
+    # CPU only (untuk feature selection)
+    n_estimators: 500
+    num_leaves: 31
+    learning_rate: 0.05
+    feature_fraction: 0.7
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    min_child_samples: 30
+    boosting_type: "gbdt"     # WAJIB 'gbdt', BUKAN 'dart'
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    n_jobs: 10                # Gunakan 10 dari 12 core
+    verbose: -1
+    random_state: 42
+    early_stopping_rounds: 50
+
+  lightgbm_final:
+    boosting_type: "gbdt"     # WAJIB 'gbdt', BUKAN 'dart'
+    objective: "binary"
+    metric: "auc"
+    num_leaves: 63
+    learning_rate: 0.02
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    min_child_samples: 50
+    reg_alpha: 0.1
+    reg_lambda: 0.5
+    n_jobs: 10
+    verbose: -1
+    seed: 42
+    num_boost_round: 2000
+    early_stopping_rounds: 100
+
+  optuna:
+    n_trials: 80
+    direction: "maximize"
+    sampler: "TPE"
+    seed: 42
+    overfit_gap_allowed: 0.03  # Penalti overfit = max(0, gap - 0.03) × 5.0
+    prob_spread_bonus_weight: 5.0
+    prob_spread_max_bonus: 0.03
+
+evaluation:
+  # Threshold scan range (dari VAL set)
+  threshold_scan_start: 0.50     # WAJIB mulai dari 0.50, bukan 0.505
+  threshold_scan_end: 0.70
+  threshold_scan_step: 0.005
+  min_coverage_for_threshold: 0.10  # Minimal 10% coverage
+
+  # High-confidence thresholds untuk laporan
+  confidence_levels: [0.50, 0.51, 0.53, 0.55, 0.57, 0.60]
+
+  # Calibration
+  calibration_method: "isotonic"  # atau "sigmoid" (Platt)
+  calibration_n_bins: 10
+
+  # Session breakdowns (jam UTC)
+  sessions:
+    us: [13, 21]
+    london: [7, 16]
+    asian: [0, 8]
+    overlap: [13, 16]
+
+  # Volatility regime thresholds
+  rvol_low_pct: 0.25   # < 25th percentile = low vol
+  rvol_high_pct: 0.75  # > 75th percentile = high vol
+
+trade_decision:
+  polymarket_fee: 0.02     # 2% biaya Polymarket
+  model_risk_margin: 0.02  # Margin untuk ketidakpastian model
+  min_ev_to_trade: 0.0     # EV > 0 setelah fee dan margin
+  max_bet_fraction: 0.05   # Maksimum 5% bankroll per bet (User request)
+  kelly_fraction: 0.25     # 25% Kelly (fractional Kelly)
+
+  # Circuit breakers
+  max_loss_24h_pct: 0.10   # Stop jika rugi > 10% dalam 24 jam
+  max_consecutive_losses: 10
+
+  # No-trade conditions
+  max_polymarket_spread: 0.05   # No trade jika spread > 5%
+  min_polymarket_depth: 10.0    # No trade jika depth < $10
+
+monitoring:
+  calibration_drift_threshold: 0.05
+  feature_drift_ks_pvalue: 0.05
+  performance_decay_threshold: 0.03
