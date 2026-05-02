@@ -202,7 +202,7 @@ evaluation:
 
 trade_decision:
   initial_bankroll: 100.0  # Modal awal untuk backtest
-  polymarket_fee: 0.08     # 2% biaya Polymarket
+  polymarket_fee: 0.02     # 2% biaya Polymarket
   model_risk_margin: 0.02  # Margin untuk ketidakpastian model
   min_ev_to_trade: 0.0     # EV > 0 setelah fee dan margin
   max_bet_fraction: 0.05   # Maksimum 5% bankroll per bet (User request)
