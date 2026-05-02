@@ -14,16 +14,24 @@ from inference_v1 import PolymarketPredictor
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def run_backtest_v1(config_path: str = "/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml"):
+# Dynamically find project root (assuming script is in src/inference/backtest_v1.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def run_backtest_v1(config_path: str = None):
+    if config_path is None:
+        config_path = str(PROJECT_ROOT / "config.yaml")
+        
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
         
-    # Use hardcoded path as requested for artifacts
-    artifacts_path = "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts"
+    # Resolve artifacts path
+    artifacts_rel = config.get('paths', {}).get('models', {}).get('artifacts', "models/artifacts")
+    artifacts_path = str(PROJECT_ROOT / artifacts_rel)
     predictor = PolymarketPredictor(artifacts_path, config_path)
     
     # 1. Load Test Data
-    features_path = Path(config['paths']['data']['features_v1']) / "final_features.parquet"
+    features_rel = Path(config['paths']['data']['features_v1'])
+    features_path = PROJECT_ROOT / features_rel / "final_features.parquet"
     df = pd.read_parquet(features_path).sort_values('round_start')
     
     # Use Test set only
@@ -46,7 +54,7 @@ def run_backtest_v1(config_path: str = "/run/media/rotan/New Volume/gemini3/poly
     test_df['p_market'] = test_df['p_market'].clip(0.1, 0.9)
 
     # 4. Trading Simulation
-    initial_bankroll = 70.0
+    initial_bankroll = config['trade_decision']['initial_bankroll']
     bankroll = initial_bankroll
     equity_curve = [initial_bankroll]
     trades = []
@@ -111,9 +119,9 @@ def run_backtest_v1(config_path: str = "/run/media/rotan/New Volume/gemini3/poly
     logger.info(f"Sharpe Ratio   : {sharpe:.2f}")
 
     # 6. Save and Plot
-    # Pastikan jalur absolut untuk root proyek
-    project_root = Path("/run/media/rotan/New Volume/gemini3/polymarket_5m")
-    output_dir = project_root / config['paths']['reports']
+    # Resolve reports path
+    output_rel = Path(config['paths']['reports'])
+    output_dir = PROJECT_ROOT / output_rel
     output_dir.mkdir(parents=True, exist_ok=True)
     
     trades_df.to_csv(output_dir / "backtest_trades.csv", index=False)

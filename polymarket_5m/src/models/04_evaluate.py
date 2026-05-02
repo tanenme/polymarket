@@ -13,6 +13,9 @@ import seaborn as sns
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Dynamically find project root (assuming script is in src/models/04_evaluate.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 def full_evaluation_v1(cb_model, lgb_model, calibrator, 
                         X_train, y_train, X_val, y_val, X_test, y_test,
                         df_test_meta, ensemble_weights, feature_cols, config, best_t):
@@ -147,7 +150,7 @@ def walk_forward_validation_v1(df: pd.DataFrame, feature_cols: list, config: dic
 
         # Quick training
         model = cb.CatBoostClassifier(
-            iterations=1000, depth=5, learning_rate=0.03,
+            iterations=1000, depth=4, learning_rate=0.01,
             task_type='GPU', gpu_ram_part=0.40,
             bootstrap_type='Bernoulli', loss_function='Logloss',
             eval_metric='AUC', early_stopping_rounds=50,
@@ -168,10 +171,12 @@ def walk_forward_validation_v1(df: pd.DataFrame, feature_cols: list, config: dic
     return results_df
 
 if __name__ == "__main__":
-    with open("/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml", "r") as f:
+    config_path = PROJECT_ROOT / "config.yaml"
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
         
-    artifacts_path = Path(config['paths']['models']['artifacts'])
+    artifacts_rel = Path(config['paths']['models']['artifacts'])
+    artifacts_path = PROJECT_ROOT / artifacts_rel
     
     # Load artifacts
     cb_model = cb.CatBoostClassifier()
@@ -183,7 +188,8 @@ if __name__ == "__main__":
     selected_features = joblib.load(artifacts_path / "selected_features_v1.pkl")
 
     # Load data for evaluation
-    features_path = Path(config['paths']['data']['features_v1']) / "final_features.parquet"
+    features_rel = Path(config['paths']['data']['features_v1'])
+    features_path = PROJECT_ROOT / features_rel / "final_features.parquet"
     df = pd.read_parquet(features_path)
 
     if 'round_start' not in df.columns:

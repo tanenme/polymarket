@@ -8,7 +8,12 @@ import yaml
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def check_data_readiness(config_path: str = "/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml"):
+# Dynamically find project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def check_data_readiness(config_path: str = None):
+    if config_path is None:
+        config_path = str(PROJECT_ROOT / "config.yaml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
         

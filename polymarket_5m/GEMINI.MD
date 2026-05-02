@@ -139,7 +139,7 @@ Coverage aktual yang diobservasi: 44% (MASALAH UTAMA)
 ### 1.2 Struktur Direktori WAJIB
 
 ```
-/run/media/rotan/New Volume/gemini3/polymarket_5m/
+./polymarket_5m/
 ├── venv/                          # Virtual environment (WAJIB)
 │   └── lib/python3.12/site-packages/
 ├── config.yaml                    # Single source of truth untuk semua parameter
@@ -209,7 +209,7 @@ Coverage aktual yang diobservasi: 44% (MASALAH UTAMA)
 
 ```bash
 # Buat venv dengan Python 3.12 (bukan 3.14 — beberapa library belum support)
-cd "/run/media/rotan/New Volume/gemini3/polymarket_5m"
+cd "polymarket_5m"
 
 python3.12 -m venv venv
 source venv/bin/activate
@@ -2035,7 +2035,7 @@ def log_live_prediction(round_start: pd.Timestamp,
 
 ```bash
 # Setiap sesi baru:
-cd "/run/media/rotan/New Volume/gemini3/polymarket_5m"
+cd "polymarket_5m"
 source venv/bin/activate
 
 # Eksekusi dalam urutan:

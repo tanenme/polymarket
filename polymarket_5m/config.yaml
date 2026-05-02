@@ -11,15 +11,15 @@ project:
 
 paths:
   data:
-    raw: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/raw"
+    raw: "data/raw"
     orderbook: "data/raw/orderbook"
     aggtrades: "data/raw/aggtrades"
-    klines_1m: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/raw/historical_1m_klines.parquet"
-    interim: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/interim"
-    features_v1: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/features/v1"
-    labels: "/run/media/rotan/New Volume/gemini3/polymarket_5m/data/labels"
+    klines_1m: "data/raw/historical_1m_klines.parquet"
+    interim: "data/interim"
+    features_v1: "data/features/v1"
+    labels: "data/labels"
   models:
-    artifacts: "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts"
+    artifacts: "models/artifacts"
     checkpoints: "models/checkpoints"
   logs: "logs"
   reports: "reports"
@@ -33,7 +33,7 @@ data:
   coverage_warning_threshold: 0.70  # Warning jika coverage < 70%
   # Data range yang tersedia
   data_start: "2025-04-29"
-  data_end: "2026-04-16"
+  data_end: "2026-04-30"
 
 features:
   # Kolom TIME yang TIDAK boleh diagregasi (hanya snapshot)
@@ -116,19 +116,19 @@ training:
     # rsm: TIDAK ADA DI SINI — tidak didukung GPU + Logloss
     # Parameter yang di-tune via Optuna:
     optuna_search_space:
-      depth: [3, 5]            # DIKECILKAN (sebelumnya 4-7) untuk mencegah kompleksitas berlebih
-      l2_leaf_reg: [50, 500]   # DINAIKKAN drastis (sebelumnya 5-150) untuk regularisasi kuat
+      depth: [2, 4]            # Pruned: Shallower trees for better generalization
+      l2_leaf_reg: [200, 2000] # Pruned: Massive regularization
       random_strength: [1.0, 20.0]
-      min_data_in_leaf: [200, 1500] # DINAIKKAN (sebelumnya 50-600) agar leaf lebih stabil
-      learning_rate: [0.001, 0.02]  # DIPERLAMBAT (sebelumnya 0.003-0.05)
+      min_data_in_leaf: [1000, 5000] # Pruned: Require huge support per split
+      learning_rate: [0.0005, 0.01]  # Pruned: Very slow, careful learning
       max_bin: [48, 128]
-      subsample: [0.5, 0.85]   # DIPERKETAT (sebelumnya 0.6-0.95) untuk bagging lebih agresif
+      subsample: [0.5, 0.85]
     # Fixed per trial
-    iterations_per_trial: 3000
-    early_stopping_per_trial: 150
+    iterations_per_trial: 2000
+    early_stopping_per_trial: 100
     # Final training
-    iterations_final: 10000
-    early_stopping_final: 500
+    iterations_final: 1000
+    early_stopping_final: 200
     snapshot_interval: 300    # seconds
 
   lightgbm_screener:
@@ -201,7 +201,8 @@ evaluation:
   rvol_high_pct: 0.75  # > 75th percentile = high vol
 
 trade_decision:
-  polymarket_fee: 0.02     # 2% biaya Polymarket
+  initial_bankroll: 100.0  # Modal awal untuk backtest
+  polymarket_fee: 0.08     # 2% biaya Polymarket
   model_risk_margin: 0.02  # Margin untuk ketidakpastian model
   min_ev_to_trade: 0.0     # EV > 0 setelah fee dan margin
   max_bet_fraction: 0.05   # Maksimum 5% bankroll per bet (User request)

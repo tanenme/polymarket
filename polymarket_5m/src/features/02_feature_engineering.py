@@ -304,9 +304,13 @@ def add_inter_round_features_v1(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
     return res
 
+# Dynamically find project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 if __name__ == "__main__":
     # Load config
-    with open("/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml", "r") as f:
+    config_path = PROJECT_ROOT / "config.yaml"
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     # 1. Load 1m Klines (Base Dataset)
@@ -372,9 +376,13 @@ def process_day_features(day, config, day_index):
 
     return day_micro
 
+# Dynamically find project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 if __name__ == "__main__":
     # Load config
-    with open("/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml", "r") as f:
+    config_path = PROJECT_ROOT / "config.yaml"
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     # 1. Load 1m Klines (Base Dataset)

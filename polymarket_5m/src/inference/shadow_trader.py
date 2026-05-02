@@ -6,191 +6,414 @@ import time
 import logging
 import json
 import os
+import talib
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 
 # Local imports
 from inference_v1 import PolymarketPredictor
-import talib
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Dynamically find project root (assuming script is in src/inference/shadow_trader.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 class ShadowTrader:
-    def __init__(self, config_path: str = "/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml"):
+    def __init__(self, config_path: str = None, test_mode: bool = False):
+        if config_path is None:
+            config_path = str(PROJECT_ROOT / "config.yaml")
+            
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
             
-        artifacts_path = "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts"
+        self.test_mode = test_mode
+        
+        # Resolve artifacts path
+        artifacts_rel = self.config.get('paths', {}).get('models', {}).get('artifacts', "models/artifacts")
+        artifacts_path = str(PROJECT_ROOT / artifacts_rel)
+        
         self.predictor = PolymarketPredictor(artifacts_path, config_path)
         
-        self.shadow_log_path = Path("/run/media/rotan/New Volume/gemini3/polymarket_5m/reports/shadow_trades.csv")
-        if not self.shadow_log_path.exists():
-            df = pd.DataFrame(columns=['timestamp', 'p_model', 'p_market', 'decision', 'entry_price', 'target_time', 'resolved', 'is_win'])
-            df.to_csv(self.shadow_log_path, index=False)
-
-    def get_binance_klines(self, symbol="BTCUSDT", interval="1m", limit=100):
-        """Fetch recent OHLCV from Binance Public API"""
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url)
-        data = res.json()
+        # Resolve reports path
+        reports_rel = self.config.get('paths', {}).get('reports', "reports")
+        reports_path = PROJECT_ROOT / reports_rel
+        reports_path.mkdir(parents=True, exist_ok=True)
         
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
+        self.shadow_log_path = reports_path / "shadow_trades.csv"
+        self.bankroll_path = reports_path / "shadow_bankroll.json"
+        
+        self.buffer_1m = pd.DataFrame()
+        self.round_history = pd.DataFrame()
+        
+        # Define Columns
+        self.log_cols = ['timestamp', 'p_model', 'p_market', 'decision', 'bet_amount', 'entry_price', 'target_time', 'resolved', 'is_win', 'net_profit', 'bankroll', 'win_return']
+        
+        # Initialize log if not exists or empty
+        if not self.shadow_log_path.exists() or self.shadow_log_path.stat().st_size == 0:
+            df = pd.DataFrame(columns=self.log_cols)
+            df.to_csv(self.shadow_log_path, index=False)
+            logger.info(f"Initialized new shadow log at {self.shadow_log_path}")
+
+        # Initialize Bankroll
+        self.initial_bankroll = 70.0
+        self.bankroll = self.load_bankroll()
+        
+        # Load history
+        if self.shadow_log_path.exists():
+            try:
+                hist = pd.read_csv(self.shadow_log_path)
+                if not hist.empty:
+                    hist['target'] = hist['is_win'].apply(lambda x: 1 if x is True else (0 if x is False else np.nan))
+                    hist['round_start'] = pd.to_datetime(hist['timestamp'])
+                    if 'win_return' not in hist.columns: 
+                        hist['win_return'] = np.nan # Default jika tidak ada
+                    if 'target' not in hist.columns: # Pastikan target juga ada
+                        hist['target'] = np.nan
+                    self.round_history = hist.set_index('round_start')
+            except Exception as e:
+                logger.warning(f"Could not load trade history: {e}")
+
+    def load_bankroll(self):
+        if self.bankroll_path.exists():
+            try:
+                with open(self.bankroll_path, 'r') as f:
+                    return json.load(f)['bankroll']
+            except: pass
+        return self.initial_bankroll
+
+    def save_bankroll(self):
+        with open(self.bankroll_path, 'w') as f:
+            json.dump({'bankroll': self.bankroll, 'last_update': str(datetime.now(UTC))}, f)
+
+    def add_technical_features_v1(self, df: pd.DataFrame) -> pd.DataFrame:
+        res = df.copy()
+        close, high, low, volume = res['close'].values, res['high'].values, res['low'].values, res['volume'].values
+        res['rsi_7']  = talib.RSI(close, timeperiod=7)
+        res['rsi_14'] = talib.RSI(close, timeperiod=14)
+        res['rsi_21'] = talib.RSI(close, timeperiod=21)
+        macd, _, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+        res['macd'] = macd
+        res['macd_hist'] = macd_hist
+        upper, middle, lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
+        res['bb_pct_20']   = (close - lower) / (upper - lower + 1e-9)
+        res['bb_width_20'] = (upper - lower) / (middle + 1e-9)
+        res['atr_14_norm'] = talib.ATR(high, low, close, timeperiod=14) / (close + 1e-9)
+        for p in [9, 21, 50]:
+            ema = talib.EMA(close, timeperiod=p)
+            res[f'ema_dist_{p}'] = (close - ema) / (ema + 1e-9)
+        res['vol_ratio_15'] = volume / (pd.Series(volume).rolling(15).mean().values + 1e-9)
+        res['vol_ratio_60'] = volume / (pd.Series(volume).rolling(60).mean().values + 1e-9)
+        pv = close * volume
+        res['vwap_rolling_60'] = pd.Series(pv).rolling(60).sum().values / (pd.Series(volume).rolling(60).sum().values + 1e-9)
+        res['vwap_dev'] = (close - res['vwap_rolling_60']) / (res['vwap_rolling_60'] + 1e-9)
+        res['vwap_dev_norm'] = res['vwap_dev'] / (res['atr_14_norm'] + 1e-9)
+        log_ret = np.log(close / (pd.Series(close).shift(1).values + 1e-9))
+        res['log_ret'] = log_ret
+        res['price_velocity'] = log_ret - pd.Series(log_ret).shift(3).values
+        res['momentum_1h'] = close / (pd.Series(close).shift(60).values + 1e-9) - 1
+        res['momentum_4h'] = close / (pd.Series(close).shift(240).values + 1e-9) - 1
+        for window in [60, 180, 300]:
+            n_candles = window // 60
+            res[f'rvol_{window}'] = pd.Series(log_ret).rolling(n_candles).std().values * np.sqrt(n_candles)
+        return res
+
+    def add_time_features_v1(self, df: pd.DataFrame) -> pd.DataFrame:
+        ts = df.index
+        hours = ts.hour + ts.minute / 60.0
+        dows  = ts.dayofweek
+        df['sin_hour'], df['cos_hour'] = np.sin(2*np.pi*hours/24), np.cos(2*np.pi*hours/24)
+        df['sin_dow'],  df['cos_dow']  = np.sin(2*np.pi*dows/7),  np.cos(2*np.pi*dows/7)
+        slot_15m = ts.hour * 4 + ts.minute // 15
+        df['sin_15m'] = np.sin(2 * np.pi * slot_15m / 96)
+        df['cos_15m'] = np.cos(2 * np.pi * slot_15m / 96)
+        df['is_us_session']     = ((ts.hour >= 13) & (ts.hour < 21)).astype(float)
+        df['is_london_session'] = ((ts.hour >= 7)  & (ts.hour < 16)).astype(float)
+        df['is_overlap']        = df['is_us_session'] * df['is_london_session']
+        df['is_weekend']        = (dows >= 5).astype(float)
+        df['is_roll_hour']       = (ts.hour % 8 == 0).astype(float)
+        df['minutes_since_roll'] = ((ts.hour % 8) * 60 + ts.minute).astype(float)
         return df
 
-    def get_active_btc_token_id(self):
-        """Mencari Token ID untuk pasar BTC Up/Down 15m yang sedang aktif"""
-        try:
-            # Query markets dengan filter 'Bitcoin'
-            url = "https://clob.polymarket.com/markets"
-            params = {"active": "true"}
-            res = requests.get(url, params=params)
-            markets = res.json()
+    def aggregate_window_features_v1(self, df_full: pd.DataFrame) -> pd.DataFrame:
+        """
+        Input: df_full dengan index datetime
+        Output: 1 baris per round, index = round_start timestamp
+        """
+        config = self.config
+        time_like_cols = set(config['features']['time_like_cols'])
+
+        df = df_full.copy()
+        # Label setiap tick dengan round yang akan diprediksi (round T dimulai pada T)
+        # Fitur diambil dari [T-15m, T)
+        df['round_label'] = df.index.floor('15min')
+
+        # Hanya pilih kolom numerik untuk perhitungan statistik
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != 'round_label']
+        
+        all_cols      = [c for c in df.columns if c != 'round_label']
+        signal_cols   = [c for c in numeric_cols if c not in time_like_cols]
+        
+        parts = []
+        grp = df.groupby('round_label')
+
+        # GROUP 2: Window Signal Stats (HANYA signal_cols yang numerik)
+        if signal_cols:
+            sig_mean  = grp[signal_cols].mean().add_prefix('win_mean_')
+            sig_std   = grp[signal_cols].std().add_prefix('win_std_')
+            sig_trend = (grp[signal_cols].last() - grp[signal_cols].first()).add_prefix('win_trend_')
+            parts.extend([sig_mean, sig_std, sig_trend])
+
+        # GROUP 1: Snapshot (semua kolom termasuk non-numerik untuk snapshot)
+        snap_all = grp[all_cols].last().add_prefix('snap_')
+        parts.append(snap_all)
+
+        # Price Action (dari harga mentah)
+        if 'close' in df.columns:
+            price_grp   = grp['close']
+            price_first = price_grp.first()
+            price_last  = price_grp.last()
+            price_min   = price_grp.min()
+            price_max   = price_grp.max()
+
+            win_ret = pd.DataFrame({
+                'win_return'         : price_last / (price_first + 1e-9) - 1,
+                'win_close_position' : (price_last - price_min) / (price_max - price_min + 1e-9),
+            }, index=price_first.index)
+            parts.append(win_ret)
+
+        # Gabungkan semua parts sekaligus
+        df_aggr = pd.concat(parts, axis=1)
+
+        # GROUP 3: Acceleration (Window half comparison)
+        # Dihitung dari df_full karena butuh resolusi tick/1m
+        for col in ['rsi_14', 'ema_dist_21', 'vwap_dev_norm']:
+            if col in df.columns:
+                df['tick_idx'] = df.groupby('round_label').cumcount()
+                df['win_size'] = df.groupby('round_label')['tick_idx'].transform('max')
+                df['is_late']  = df['tick_idx'] > (df['win_size'] / 2)
+                
+                accel = df.groupby(['round_label', 'is_late'])[col].mean().unstack()
+                if accel.shape[1] == 2:
+                    accel.columns = ['early', 'late']
+                    accel_series = (accel['late'] - accel['early']).rename(f'win_{col}_accel')
+                    df_aggr = pd.concat([df_aggr, accel_series], axis=1)
+
+        # SHIFT INDEX: features dari [T-15m, T) → digunakan untuk prediksi round T
+        df_aggr.index = df_aggr.index + pd.Timedelta(minutes=15)
+        df_aggr.index.name = 'round_start'
+
+        return df_aggr
+
+    def add_inter_round_features_v1(self, df_aggr: pd.DataFrame) -> pd.DataFrame:
+        """
+        WAJIB: Semua menggunakan .shift(N) dengan N >= 1
+        DILARANG: .shift(0) = current round = leakage
+        """
+        res = df_aggr.copy()
+        
+        # Ambil parameter dari config
+        n_lags = self.config['features']['inter_round_lags']
+        roll_wins = self.config['features']['inter_round_rolling']
+
+        # Initialize columns with NaN to prevent KeyError in model inference
+        for lag in range(1, n_lags + 1):
+            res[f'past_ret_lag{lag}'] = np.nan
+            res[f'past_up_lag{lag}'] = np.nan
+        res['past_ret_abs_lag1'] = np.nan
+        for w in roll_wins:
+            res[f'past_ret_sum_{w}'] = np.nan
+            res[f'past_rvol_{w}'] = np.nan
+            res[f'past_up_rate_{w}'] = np.nan
+        res['past_ret_zscore_8'] = np.nan
+
+        if self.round_history.empty:
+            return res
+        
+        # Gabungkan history dengan data baru untuk perhitungan shift
+        combined = pd.concat([self.round_history, res]).sort_index()
+        
+        # Untuk lag returns
+        if 'win_return' in combined.columns:
+            for lag in range(1, n_lags + 1):
+                res[f'past_ret_lag{lag}'] = combined['win_return'].shift(lag).iloc[-1]
+            res['past_ret_abs_lag1'] = combined['win_return'].shift(1).abs().iloc[-1]
+        
+        # Untuk lag target (jika ada)
+        if 'target' in combined.columns:
+            for lag in range(1, n_lags + 1):
+                res[f'past_up_lag{lag}'] = combined['target'].shift(lag).iloc[-1]
+        
+        # Rolling stats antar-round
+        for w in roll_wins:
+            if 'win_return' in combined.columns:
+                past_ret = combined['win_return'].shift(1)
+                res[f'past_ret_sum_{w}'] = past_ret.rolling(w, min_periods=max(1, w//2)).sum().iloc[-1]
+                res[f'past_rvol_{w}'] = past_ret.rolling(w, min_periods=max(1, w//2)).std().iloc[-1]
             
-            # Cari market yang mengandung 'Bitcoin' dan '15-minute' (atau format serupa)
-            # Catatan: Polymarket sering menggunakan nama seperti "Bitcoin price at 5:30 PM..."
-            now = datetime.now(UTC)
-            target_hour = now.hour
-            # Sesuaikan pencarian string berdasarkan pola nama pasar Polymarket
+            if 'target' in combined.columns:
+                past_up = combined['target'].shift(1)
+                res[f'past_up_rate_{w}'] = past_up.rolling(w, min_periods=max(1, w//2)).mean().iloc[-1]
+        
+        # Mean reversion z-score
+        if 'past_ret_lag1' in res.columns and 'past_rvol_8' in res.columns:
+            res['past_ret_zscore_8'] = res['past_ret_lag1'] / (res['past_rvol_8'] + 1e-9)
+        
+        return res
+
+    def sync_data(self):
+        logger.info("Syncing historical data for 100% consistency...")
+        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=300"
+        df = pd.DataFrame(requests.get(url).json(), columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = df[col].astype(float)
+        tr_url = "https://api.binance.com/api/v3/aggTrades?symbol=BTCUSDT&limit=5000"
+        tr_df = pd.DataFrame(requests.get(tr_url).json())
+        tr_df['T'] = pd.to_datetime(tr_df['T'], unit='ms')
+        tr_df['q'] = tr_df['q'].astype(float)
+        tr_df['buy_vol'] = np.where(tr_df['m'] == False, tr_df['q'], 0)
+        tr_df['sell_vol'] = np.where(tr_df['m'] == True, tr_df['q'], 0)
+        vpin_res = tr_df.set_index('T').resample('1min').apply(lambda x: abs(x['buy_vol'].sum() - x['sell_vol'].sum()) / (x['q'].sum() + 1e-9))
+        vpin_1m = pd.DataFrame(index=vpin_res.index)
+        vpin_1m['vpin_mean'] = vpin_res.values
+        vpin_1m['vpin_std'] = 0.0
+        df = df.join(vpin_1m, how='left').fillna(0)
+        df['obi_mean'], df['obi_std'] = 0.0, 0.0 
+        df['ofi_mean'], df['ofi_std'] = 0.0, 0.0
+        self.buffer_1m = df
+
+    def get_polymarket_data(self):
+        try:
+            url = "https://clob.polymarket.com/markets?active=true"
+            markets = requests.get(url).json().get('data', [])
             for m in markets:
                 desc = m.get('description', '').lower()
                 if 'bitcoin' in desc and 'price' in desc:
-                    # Ambil token ID untuk 'YES' (biasanya indeks 0)
-                    return m['tokens'][0]['token_id'], m['description']
-            return None, None
-        except Exception as e:
-            logger.error(f"Error finding active market: {e}")
-            return None, None
+                    t_id = m['tokens'][0]['token_id']
+                    book = requests.get(f"https://clob.polymarket.com/book?token_id={t_id}").json()
+                    b0_v, a0_v = float(book['bids'][0]['size']), float(book['asks'][0]['size'])
+                    b0_p, a0_p = float(book['bids'][0]['price']), float(book['asks'][0]['price'])
+                    obi = (b0_v - a0_v) / (b0_v + a0_v + 1e-9)
+                    ofi = (b0_v - a0_v) / (b0_v + a0_v + 1e-9)
+                    mid = (b0_p + a0_p) / 2
+                    return obi, ofi, mid, m['question']
+            return 0.0, 0.0, 0.50, "N/A"
+        except: return 0.0, 0.0, 0.50, "N/A"
 
-    def get_polymarket_price(self):
-        """Fetch current mid-price from Polymarket CLOB"""
-        token_id, desc = self.get_active_btc_token_id()
-        if not token_id:
-            return 0.50 # Fallback
-            
-        try:
-            url = f"https://clob.polymarket.com/book?token_id={token_id}"
-            res = requests.get(url)
-            book = res.json()
-            
-            # Mid price = (Best Bid + Best Ask) / 2
-            best_bid = float(book['bids'][0]['price']) if book.get('bids') else 0.50
-            best_ask = float(book['asks'][0]['price']) if book.get('asks') else 0.50
-            
-            mid_price = (best_bid + best_ask) / 2
-            logger.info(f"Market: {desc} | Price: {mid_price:.4f}")
-            return mid_price
-        except Exception as e:
-            logger.error(f"Error fetching CLOB price: {e}")
-            return 0.50
+    def run_prediction(self):
+        logger.info(f"Running Prediction ({'TEST' if self.test_mode else 'NORMAL'} MODE)...")
+        self.sync_data() 
+        obi, ofi, p_market, desc = self.get_polymarket_data()
+        self.buffer_1m.iloc[-1, self.buffer_1m.columns.get_loc('obi_mean')] = obi
+        self.buffer_1m.iloc[-1, self.buffer_1m.columns.get_loc('ofi_mean')] = ofi
+        df_1m = self.add_technical_features_v1(self.buffer_1m)
+        df_1m = self.add_time_features_v1(df_1m)
+        df_aggr = self.aggregate_window_features_v1(df_1m.tail(15))
+        df_final = self.add_inter_round_features_v1(df_aggr)
+        
+        X = df_final[self.predictor.selected_features]
+        p_model = self.predictor.predict_probability(X)[0]
+        decision = self.predictor.get_trade_decision(p_model, p_market)
+        
+        now_utc = datetime.now(UTC)
+        target_mins = 2 if self.test_mode else 15
+        target_time = (now_utc + timedelta(minutes=target_mins)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Calculate Bet Amount
+        bet_amount = self.bankroll * decision['bet_size'] if decision['decision'] != 'SKIP' else 0.0
+        
+        new_trade = {
+            'timestamp': now_utc.strftime('%Y-%m-%d %H:%M:%S'),
+            'p_model': p_model,
+            'p_market': p_market,
+            'decision': decision['decision'],
+            'bet_amount': bet_amount,
+            'entry_price': self.buffer_1m['close'].iloc[-1],
+            'target_time': target_time,
+            'resolved': False,
+            'is_win': None,
+            'net_profit': 0.0,
+            'bankroll': self.bankroll,
+            'win_return': df_aggr['win_return'].iloc[-1]
+        }
+        
+        df_log = pd.read_csv(self.shadow_log_path) if self.shadow_log_path.exists() else pd.DataFrame()
+        df_log = pd.concat([df_log, pd.DataFrame([new_trade])], ignore_index=True)
+        df_log.to_csv(self.shadow_log_path, index=False)
+        
+        # Update local history
+        new_hist = pd.DataFrame({
+            'target': [np.nan], # Belum resolved
+            'win_return': [df_aggr['win_return'].iloc[-1]] # Tambahkan win_return ke history
+        }, index=[pd.to_datetime(new_trade['timestamp'])])
+        self.round_history = pd.concat([self.round_history, new_hist])
+        logger.info(f"Market: {desc} | Model: {p_model:.4f} | Decision: {decision['decision']} | Bet: ${bet_amount:.2f}")
 
-    def compute_realtime_features(self, df_1m):
-        """Simplified version of 02_feature_engineering for a single snapshot"""
-        df = df_1m.copy()
-        close = df['close'].values
-        
-        # Technicals
-        df['rsi_14'] = talib.RSI(close, timeperiod=14)
-        macd, _, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-        df['macd_hist'] = macd_hist
-        
-        # Realized Vol
-        log_ret = np.log(df['close'] / (df['close'].shift(1) + 1e-9))
-        df['rvol_300'] = log_ret.rolling(5).std() * np.sqrt(5)
-        
-        latest_features = pd.DataFrame(index=[df.index[-1]])
-        for col in self.predictor.selected_features:
-            if col in df.columns:
-                latest_features[col] = df[col].iloc[-1]
-            elif col.startswith('snap_') and col[5:] in df.columns:
-                latest_features[col] = df[col[5:]].iloc[-1]
-            else:
-                latest_features[col] = 0.0 # Placeholder
-                
-        return latest_features
-
-    def run_one_iteration(self):
-        logger.info("Starting Shadow Trade iteration...")
-        
-        try:
-            df_1m = self.get_binance_klines()
-            current_price = df_1m['close'].iloc[-1]
-            p_market = self.get_polymarket_price()
-            
-            X = self.compute_realtime_features(df_1m)
-            
-            p_model = self.predictor.predict_probability(X)[0]
-            decision = self.predictor.get_trade_decision(p_model, p_market)
-            
-            now_utc = datetime.now(UTC)
-            target_time = (now_utc + timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
-            
-            new_trade = {
-                'timestamp': now_utc.strftime('%Y-%m-%d %H:%M:%S'),
-                'p_model': p_model,
-                'p_market': p_market,
-                'decision': decision['decision'],
-                'entry_price': current_price,
-                'target_time': target_time,
-                'resolved': False,
-                'is_win': None
-            }
-            
-            df_log = pd.read_csv(self.shadow_log_path)
-            df_log = pd.concat([df_log, pd.DataFrame([new_trade])], ignore_index=True)
-            df_log.to_csv(self.shadow_log_path, index=False)
-            
-            logger.info(f"Decision: {decision['decision']} | Model: {p_model:.4f} | Market: {p_market:.2f}")
-            
-        except Exception as e:
-            logger.error(f"Error in shadow trader iteration: {e}")
-
-    def resolve_old_trades(self):
-        """Check trades from 15 mins ago against current price"""
+    def resolve_trades(self):
         if not self.shadow_log_path.exists(): return
         
-        df_log = pd.read_csv(self.shadow_log_path)
-        if df_log.empty: return
-        
         try:
-            df_1m = self.get_binance_klines()
-            current_price = df_1m['close'].iloc[-1]
-            now = datetime.now(UTC)
-            
-            updated = False
-            for idx, row in df_log.iterrows():
-                if not row['resolved'] and row['decision'] != 'SKIP':
-                    target_dt = datetime.strptime(row['target_time'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=UTC)
-                    if now >= target_dt:
-                        actual_up = current_price > row['entry_price']
-                        is_win = (row['decision'] == 'BET_YES' and actual_up) or \
-                                 (row['decision'] == 'BET_NO' and not actual_up)
-                        
-                        df_log.at[idx, 'resolved'] = True
-                        df_log.at[idx, 'is_win'] = is_win
-                        updated = True
-                        logger.info(f"Resolved trade from {row['timestamp']}: {'WIN' if is_win else 'LOSS'} (Price: {row['entry_price']} -> {current_price})")
-            
-            if updated:
-                df_log.to_csv(self.shadow_log_path, index=False)
-        except Exception as e:
-            logger.error(f"Error resolving trades: {e}")
+            df_log = pd.read_csv(self.shadow_log_path)
+            if df_log.empty: return
+        except pd.errors.EmptyDataError:
+            return
 
-if __name__ == "__main__":
-    trader = ShadowTrader()
-    logger.info("Shadow Trader active (Modernized UTC). Press Ctrl+C to stop.")
-    
-    while True:
-        trader.resolve_old_trades()
+        df_log['resolved'] = df_log['resolved'].astype(object)
+        df_log['is_win'] = df_log['is_win'].astype(object)
         
         now = datetime.now(UTC)
-        if now.minute % 15 == 0 and now.second < 10:
-            trader.run_one_iteration()
-            time.sleep(15)
-            
+        try:
+            curr_p = float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").json()['price'])
+        except: return
+        
+        updated = False
+        for idx, row in df_log.iterrows():
+            if row['resolved'] != True and row['decision'] != 'SKIP':
+                target_dt = datetime.strptime(row['target_time'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=UTC)
+                if now >= target_dt:
+                    is_win = (row['decision'] == 'BET_YES' and curr_p > row['entry_price']) or \
+                             (row['decision'] == 'BET_NO' and curr_p <= row['entry_price'])
+                    
+                    # Calculate Profit (Polymarket logic)
+                    bet_amount = row['bet_amount']
+                    if is_win:
+                        p_m = row['p_market'] if row['decision'] == 'BET_YES' else (1 - row['p_market'])
+                        gross_profit = bet_amount * (1/p_m - 1)
+                        net_profit = gross_profit * (1 - self.config['trade_decision']['polymarket_fee'])
+                    else:
+                        net_profit = -bet_amount
+                    
+                    self.bankroll += net_profit
+                    df_log.at[idx, 'resolved'] = True
+                    df_log.at[idx, 'is_win'] = bool(is_win)
+                    df_log.at[idx, 'net_profit'] = net_profit
+                    df_log.at[idx, 'bankroll'] = self.bankroll
+                    
+                    updated = True
+                    ts = pd.to_datetime(row['timestamp'])
+                    if ts in self.round_history.index:
+                        self.round_history.at[ts, 'target'] = 1 if is_win else 0
+                    
+                    logger.info(f"RESOLVED: {row['timestamp']} | {'WIN' if is_win else 'LOSS'} | Net: ${net_profit:+.2f} | Balance: ${self.bankroll:.2f}")
+        
+        if updated: 
+            df_log.to_csv(self.shadow_log_path, index=False)
+            self.save_bankroll()
+
+if __name__ == "__main__":
+    is_test = "--test" in sys.argv
+    trader = ShadowTrader(test_mode=is_test)
+    logger.info(f"Shadow Trader Mode: {'TEST (2m)' if is_test else 'NORMAL (15m)'}")
+    logger.info(f"Current Bankroll: ${trader.bankroll:.2f}")
+    
+    while True:
+        trader.resolve_trades()
+        now = datetime.now(UTC)
+        interval = 2 if is_test else 15
+        if now.minute % interval == 0 and now.second < 10:
+            trader.run_prediction()
+            time.sleep(20)
         time.sleep(5)

@@ -20,6 +20,9 @@ from regime_detector import RegimeDetector
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Dynamically find project root (assuming script is in src/models/03_training.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 def load_and_validate_data_v1(features_path: str, config: dict) -> pd.DataFrame:
     logger.info(f"Loading data from {features_path}...")
     df = pd.read_parquet(features_path)
@@ -77,7 +80,7 @@ def compute_sample_weights(train_df: pd.DataFrame, config: dict) -> np.ndarray:
     vol_thresh = np.abs(train_df['future_return']).median()
     weights = np.where(np.abs(train_df['future_return']) >= vol_thresh, w_high, w_low)
 
-    logger.info(f"Sample weights: high={w_high}x, low={w_low}x, vol_threshold={vol_thresh:.5f}")
+    logger.info(f"Sample weights: high={w_high}x, low={w_low}x, vol_threshold={vol_threshold:.5f}")
     return weights
 
 def reduce_features_via_lgbm_v1(X_train, y_train, X_val, y_val, w_train, config):
@@ -216,7 +219,8 @@ def calibrate_and_threshold(cb_model, lgb_model, X_val, y_val, config):
 
 def run_training_pipeline(config):
     # 1. Load data
-    features_path = Path(config['paths']['data']['features_v1']) / "final_features.parquet"
+    features_rel = Path(config['paths']['data']['features_v1'])
+    features_path = PROJECT_ROOT / features_rel / "final_features.parquet"
     df = load_and_validate_data_v1(features_path, config)
     
     # 2. Filter features
@@ -254,7 +258,11 @@ def run_training_pipeline(config):
     
     # 4. Regime Detector
     regime_detector = RegimeDetector().fit(X_train)
-    regime_detector.save(Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/regime_detector_v1.pkl")
+    artifacts_rel = Path(config['paths']['models']['artifacts'])
+    artifacts_path = PROJECT_ROOT / artifacts_rel
+    artifacts_path.mkdir(parents=True, exist_ok=True)
+    
+    regime_detector.save(artifacts_path / "regime_detector_v1.pkl")
     
     # 5. Feature Selection
     selected_features = reduce_features_via_lgbm_v1(X_train, y_train, X_val, y_val, w_train, config)
@@ -262,22 +270,22 @@ def run_training_pipeline(config):
     X_val_sub = X_val[selected_features].astype(np.float32)
     X_test_sub = X_test[selected_features].astype(np.float32)
     
-    joblib.dump(selected_features, Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/selected_features_v1.pkl")
+    joblib.dump(selected_features, artifacts_path / "selected_features_v1.pkl")
     
     # 6. Optimization
     best_params_cb = optimize_catboost(X_train_sub, y_train, X_val_sub, y_val, w_train, config)
-    joblib.dump(best_params_cb, Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/best_params_v1.pkl")
+    joblib.dump(best_params_cb, artifacts_path / "best_params_v1.pkl")
     
     # 7. Final Training
     cb_model, lgb_model = train_final_models(X_train_sub, y_train, X_val_sub, y_val, w_train, best_params_cb, config)
-    cb_model.save_model(str(Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/catboost_final_v1.cbm"))
-    joblib.dump(lgb_model, Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/lgbm_final_v1.pkl")
+    cb_model.save_model(str(artifacts_path / "catboost_final_v1.cbm"))
+    joblib.dump(lgb_model, artifacts_path / "lgbm_final_v1.pkl")
     
     # 8. Calibration & Threshold
     calibrator, ensemble_weights, best_t = calibrate_and_threshold(cb_model, lgb_model, X_val_sub, y_val, config)
-    joblib.dump(calibrator, Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/calibrator_v1.pkl")
-    joblib.dump(ensemble_weights, Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/ensemble_weights_v1.pkl")
-    joblib.dump(best_t, Path(config['paths']['models']['artifacts']) / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/optimal_threshold_v1.pkl")
+    joblib.dump(calibrator, artifacts_path / "calibrator_v1.pkl")
+    joblib.dump(ensemble_weights, artifacts_path / "ensemble_weights_v1.pkl")
+    joblib.dump(best_t, artifacts_path / "optimal_threshold_v1.pkl")
     
     # 9. Test Evaluation
     p_cb_test = cb_model.predict_proba(X_test_sub)[:, 1]
@@ -293,6 +301,7 @@ def run_training_pipeline(config):
     logger.info(f"FINAL TEST RESULTS: AUC={auc_test:.4f} | Acc={acc_test:.2%} | Cov={cov_test:.2%}")
 
 if __name__ == "__main__":
-    with open("/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml", "r") as f:
+    config_path = PROJECT_ROOT / "config.yaml"
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
     run_training_pipeline(config)

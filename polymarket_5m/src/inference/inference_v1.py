@@ -7,37 +7,47 @@ import sys
 from pathlib import Path
 import catboost as cb
 
+# Dynamically find project root (assuming script is in src/inference/inference_v1.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 # Menambahkan folder models ke path agar kelas RegimeDetector bisa ditemukan saat joblib.load
-sys.path.append("/run/media/rotan/New Volume/gemini3/polymarket_5m/src/models")
+sys.path.append(str(PROJECT_ROOT / "src/models"))
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class PolymarketPredictor:
-    def __init__(self, artifacts_path: str, config_path: str = "/run/media/rotan/New Volume/gemini3/polymarket_5m/config.yaml"):
+    def __init__(self, artifacts_path: str = None, config_path: str = None):
+        if config_path is None:
+            config_path = str(PROJECT_ROOT / "config.yaml")
+            
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
             
-        self.artifacts_path = Path(artifacts_path)
+        if artifacts_path is None:
+            # Try to get from config, else default to models/artifacts
+            artifacts_rel = self.config.get('paths', {}).get('models', {}).get('artifacts', "models/artifacts")
+            self.artifacts_path = PROJECT_ROOT / artifacts_rel
+        else:
+            self.artifacts_path = Path(artifacts_path)
         
         # Load artifacts
-        logger.info("Loading models and artifacts...")
+        logger.info(f"Loading models and artifacts from {self.artifacts_path}...")
         self.cb_model = cb.CatBoostClassifier()
-        self.cb_model.load_model(str(self.artifacts_path / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/catboost_final_v1.cbm"))
+        self.cb_model.load_model(str(self.artifacts_path / "catboost_final_v1.cbm"))
         
-        self.lgb_model = joblib.load(self.artifacts_path / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/lgbm_final_v1.pkl")
-        self.calibrator = joblib.load(self.artifacts_path / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/calibrator_v1.pkl")
-        self.ensemble_weights = joblib.load(self.artifacts_path / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/ensemble_weights_v1.pkl")
-        self.best_t = joblib.load(self.artifacts_path / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/optimal_threshold_v1.pkl")
-        self.selected_features = joblib.load(self.artifacts_path / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/selected_features_v1.pkl")
+        self.lgb_model = joblib.load(self.artifacts_path / "lgbm_final_v1.pkl")
+        self.calibrator = joblib.load(self.artifacts_path / "calibrator_v1.pkl")
+        self.ensemble_weights = joblib.load(self.artifacts_path / "ensemble_weights_v1.pkl")
+        self.best_t = joblib.load(self.artifacts_path / "optimal_threshold_v1.pkl")
+        self.selected_features = joblib.load(self.artifacts_path / "selected_features_v1.pkl")
         
         try:
-            # Perbaikan import regime_detector (asumsi ada di PYTHONPATH atau folder yang sama)
             from regime_detector import RegimeDetector
-            self.regime_detector = RegimeDetector.load(str(self.artifacts_path / "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts/regime_detector_v1.pkl"))
-        except:
-            logger.warning("Regime detector not found or failed to load.")
+            self.regime_detector = RegimeDetector.load(str(self.artifacts_path / "regime_detector_v1.pkl"))
+        except Exception as e:
+            logger.warning(f"Regime detector not found or failed to load: {e}")
             self.regime_detector = None
 
     def predict_probability(self, X: pd.DataFrame) -> np.ndarray:
@@ -104,6 +114,7 @@ class PolymarketPredictor:
 
 if __name__ == "__main__":
     # Example usage
-    artifacts = "/run/media/rotan/New Volume/gemini3/polymarket_5m/models/artifacts"
-    predictor = PolymarketPredictor(artifacts)
+    artifacts_rel = "models/artifacts"
+    artifacts = PROJECT_ROOT / artifacts_rel
+    predictor = PolymarketPredictor(str(artifacts))
     logger.info("Predictor initialized and ready.")
