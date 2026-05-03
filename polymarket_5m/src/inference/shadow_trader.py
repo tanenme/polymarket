@@ -406,10 +406,7 @@ class ShadowTrader:
             if df_log.empty: return
         except: return
 
-        # FIX: Paksa kolom ke tipe 'object' agar bisa menerima True/False tanpa error float64
         df_log['resolved'] = df_log['resolved'].astype(object)
-        if 'is_win' in df_log.columns:
-            df_log['is_win'] = df_log['is_win'].astype(object)
         
         now = datetime.now(UTC)
         try:
