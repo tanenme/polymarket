@@ -50,7 +50,7 @@ class ShadowTrader:
         self.round_history = pd.DataFrame()
         
         # Define Columns
-        self.log_cols = ['timestamp', 'p_model', 'p_market', 'decision', 'bet_amount', 'entry_price_binance', 'execution_price', 'target_time', 'resolved', 'is_win', 'net_profit', 'bankroll', 'win_return', 'win_rate', 'max_drawdown']
+        self.log_cols = ['timestamp', 'p_model', 'p_market', 'decision', 'bet_amount', 'execution_price', 'entry_price_binance', 'target_time', 'resolved', 'is_win', 'net_profit', 'bankroll', 'win_return', 'win_rate', 'max_drawdown']
         
         # Initialize log if not exists or empty
         if not self.shadow_log_path.exists() or self.shadow_log_path.stat().st_size == 0:
@@ -59,7 +59,7 @@ class ShadowTrader:
             logger.info(f"Initialized new shadow log at {self.shadow_log_path}")
 
         # Initialize Bankroll
-        self.initial_bankroll = 70.0
+        self.initial_bankroll = self.config['trade_decision'].get('initial_bankroll', 70.0)
         self.bankroll = self.load_bankroll()
         
         # Load history
@@ -67,12 +67,7 @@ class ShadowTrader:
             try:
                 hist = pd.read_csv(self.shadow_log_path)
                 if not hist.empty:
-                    hist['target'] = hist['is_win'].apply(lambda x: 1 if x is True else (0 if x is False else np.nan))
                     hist['round_start'] = pd.to_datetime(hist['timestamp'])
-                    if 'win_return' not in hist.columns: 
-                        hist['win_return'] = np.nan # Default jika tidak ada
-                    if 'target' not in hist.columns: # Pastikan target juga ada
-                        hist['target'] = np.nan
                     self.round_history = hist.set_index('round_start')
             except Exception as e:
                 logger.warning(f"Could not load trade history: {e}")
@@ -139,87 +134,52 @@ class ShadowTrader:
         return df
 
     def aggregate_window_features_v1(self, df_full: pd.DataFrame) -> pd.DataFrame:
-        """
-        Input: df_full dengan index datetime
-        Output: 1 baris per round, index = round_start timestamp
-        """
         config = self.config
         time_like_cols = set(config['features']['time_like_cols'])
-
         df = df_full.copy()
-        # Label setiap tick dengan round yang akan diprediksi (round T dimulai pada T)
-        # Fitur diambil dari [T-15m, T)
         df['round_label'] = df.index.floor('15min')
-
-        # Hanya pilih kolom numerik untuk perhitungan statistik
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != 'round_label']
-        
         all_cols      = [c for c in df.columns if c != 'round_label']
         signal_cols   = [c for c in numeric_cols if c not in time_like_cols]
-        
         parts = []
         grp = df.groupby('round_label')
-
-        # GROUP 2: Window Signal Stats (HANYA signal_cols yang numerik)
         if signal_cols:
             sig_mean  = grp[signal_cols].mean().add_prefix('win_mean_')
             sig_std   = grp[signal_cols].std().add_prefix('win_std_')
             sig_trend = (grp[signal_cols].last() - grp[signal_cols].first()).add_prefix('win_trend_')
             parts.extend([sig_mean, sig_std, sig_trend])
-
-        # GROUP 1: Snapshot (semua kolom termasuk non-numerik untuk snapshot)
         snap_all = grp[all_cols].last().add_prefix('snap_')
         parts.append(snap_all)
-
-        # Price Action (dari harga mentah)
         if 'close' in df.columns:
             price_grp   = grp['close']
             price_first = price_grp.first()
             price_last  = price_grp.last()
             price_min   = price_grp.min()
             price_max   = price_grp.max()
-
             win_ret = pd.DataFrame({
                 'win_return'         : price_last / (price_first + 1e-9) - 1,
                 'win_close_position' : (price_last - price_min) / (price_max - price_min + 1e-9),
             }, index=price_first.index)
             parts.append(win_ret)
-
-        # Gabungkan semua parts sekaligus
         df_aggr = pd.concat(parts, axis=1)
-
-        # GROUP 3: Acceleration (Window half comparison)
-        # Dihitung dari df_full karena butuh resolusi tick/1m
         for col in ['rsi_14', 'ema_dist_21', 'vwap_dev_norm']:
             if col in df.columns:
                 df['tick_idx'] = df.groupby('round_label').cumcount()
                 df['win_size'] = df.groupby('round_label')['tick_idx'].transform('max')
                 df['is_late']  = df['tick_idx'] > (df['win_size'] / 2)
-                
                 accel = df.groupby(['round_label', 'is_late'])[col].mean().unstack()
                 if accel.shape[1] == 2:
                     accel.columns = ['early', 'late']
                     accel_series = (accel['late'] - accel['early']).rename(f'win_{col}_accel')
                     df_aggr = pd.concat([df_aggr, accel_series], axis=1)
-
-        # SHIFT INDEX: features dari [T-15m, T) → digunakan untuk prediksi round T
         df_aggr.index = df_aggr.index + pd.Timedelta(minutes=15)
         df_aggr.index.name = 'round_start'
-
         return df_aggr
 
     def add_inter_round_features_v1(self, df_aggr: pd.DataFrame) -> pd.DataFrame:
-        """
-        WAJIB: Semua menggunakan .shift(N) dengan N >= 1
-        DILARANG: .shift(0) = current round = leakage
-        """
         res = df_aggr.copy()
-        
-        # Ambil parameter dari config
         n_lags = self.config['features']['inter_round_lags']
         roll_wins = self.config['features']['inter_round_rolling']
-
-        # Initialize columns with NaN to prevent KeyError in model inference
         for lag in range(1, n_lags + 1):
             res[f'past_ret_lag{lag}'] = np.nan
             res[f'past_up_lag{lag}'] = np.nan
@@ -229,39 +189,26 @@ class ShadowTrader:
             res[f'past_rvol_{w}'] = np.nan
             res[f'past_up_rate_{w}'] = np.nan
         res['past_ret_zscore_8'] = np.nan
-
         if self.round_history.empty:
             return res
-        
-        # Gabungkan history dengan data baru untuk perhitungan shift
         combined = pd.concat([self.round_history, res]).sort_index()
-        
-        # Untuk lag returns
         if 'win_return' in combined.columns:
             for lag in range(1, n_lags + 1):
                 res[f'past_ret_lag{lag}'] = combined['win_return'].shift(lag).iloc[-1]
             res['past_ret_abs_lag1'] = combined['win_return'].shift(1).abs().iloc[-1]
-        
-        # Untuk lag target (jika ada)
         if 'target' in combined.columns:
             for lag in range(1, n_lags + 1):
                 res[f'past_up_lag{lag}'] = combined['target'].shift(lag).iloc[-1]
-        
-        # Rolling stats antar-round
         for w in roll_wins:
             if 'win_return' in combined.columns:
                 past_ret = combined['win_return'].shift(1)
                 res[f'past_ret_sum_{w}'] = past_ret.rolling(w, min_periods=max(1, w//2)).sum().iloc[-1]
                 res[f'past_rvol_{w}'] = past_ret.rolling(w, min_periods=max(1, w//2)).std().iloc[-1]
-            
             if 'target' in combined.columns:
                 past_up = combined['target'].shift(1)
                 res[f'past_up_rate_{w}'] = past_up.rolling(w, min_periods=max(1, w//2)).mean().iloc[-1]
-        
-        # Mean reversion z-score
         if 'past_ret_lag1' in res.columns and 'past_rvol_8' in res.columns:
             res['past_ret_zscore_8'] = res['past_ret_lag1'] / (res['past_rvol_8'] + 1e-9)
-        
         return res
 
     def sync_data(self):
@@ -293,111 +240,76 @@ class ShadowTrader:
             return market['best_bid'], market['best_ask'], (market['best_bid'] + market['best_ask'])/2, market['question']
         return 0.0, 0.0, 0.50, "N/A"
 
+    def get_performance_stats(self, df=None):
+        if df is None:
+            if not self.shadow_log_path.exists(): return 0.0, 0.0
+            try:
+                df = pd.read_csv(self.shadow_log_path)
+            except: return 0.0, 0.0
+            
+        try:
+            # Type Fixes to prevent errors
+            df['resolved'] = df['resolved'].astype(object)
+            if 'is_win' in df.columns: df['is_win'] = df['is_win'].astype(object)
+            for col in ['bankroll', 'win_rate', 'max_drawdown']:
+                if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+                
+            resolved = df[df['resolved'] == True].copy()
+            if resolved.empty: return 0.0, 0.0
+                
+            win_rate = resolved['is_win'].astype(bool).mean()
+            bankroll_history = resolved['bankroll'].astype(float).values
+            full_history = np.insert(bankroll_history, 0, self.initial_bankroll)
+            peaks = np.maximum.accumulate(full_history)
+            drawdowns = (peaks - full_history) / (peaks + 1e-9)
+            max_dd = np.max(drawdowns)
+            return win_rate, max_dd
+        except: return 0.0, 0.0
+
     def run_prediction(self):
         logger.info(f"Running Prediction ({'TEST' if self.test_mode else 'NORMAL'} MODE)...")
         self.sync_data() 
         best_bid, best_ask, p_market_mid, desc = self.get_polymarket_data()
-        
-        # PROTEKSI: Jika harga 0.0, jangan trade!
         if best_bid == 0.0 or best_ask == 0.0:
-            logger.warning("Invalid market data (0.0). Skipping prediction to avoid false trade.")
+            logger.warning("Invalid market data (0.0). Skipping prediction.")
             return
-            
-        # Integrasi OBI sederhana dari spread untuk buffer
         obi = (best_bid - (1 - best_ask))
-        
         self.buffer_1m.iloc[-1, self.buffer_1m.columns.get_loc('obi_mean')] = obi
         df_1m = self.add_technical_features_v1(self.buffer_1m)
         df_1m = self.add_time_features_v1(df_1m)
         df_aggr = self.aggregate_window_features_v1(df_1m.tail(15))
         df_final = self.add_inter_round_features_v1(df_aggr)
-        
         X = df_final[self.predictor.selected_features]
         p_model = self.predictor.predict_probability(X)[0]
-        
-        # Trade Decision menggunakan Midpoint sebagai benchmark probabilitas market
         decision = self.predictor.get_trade_decision(p_model, p_market_mid)
-        
-        # REAL PAYOFF LOGIC: Tentukan harga eksekusi berdasarkan Side
         execution_price = 0.0
         if decision['decision'] == 'BET_YES':
             execution_price = best_ask
         elif decision['decision'] == 'BET_NO':
             execution_price = 1 - best_bid
-            
-        # Jika SKIP, tidak perlu mencatat log trade baru
         if decision['decision'] == 'SKIP':
             logger.info(f"Model: {p_model:.4f} | Market: {p_market_mid:.4f} | Decision: SKIP")
             return
-            
         now_utc = datetime.now(UTC)
         target_mins = 2 if self.test_mode else 15
         target_time = (now_utc + timedelta(minutes=target_mins)).strftime('%Y-%m-%d %H:%M:%S')
-        
         bet_amount = self.bankroll * decision['bet_size']
-        
         wr, mdd = self.get_performance_stats()
-        
         new_trade = {
             'timestamp': now_utc.strftime('%Y-%m-%d %H:%M:%S'),
-            'p_model': p_model,
-            'p_market': p_market_mid,
-            'decision': decision['decision'],
-            'bet_amount': bet_amount,
-            'execution_price': execution_price,
+            'p_model': p_model, 'p_market': p_market_mid, 'decision': decision['decision'],
+            'bet_amount': bet_amount, 'execution_price': execution_price,
             'entry_price_binance': self.buffer_1m['close'].iloc[-1],
-            'target_time': target_time,
-            'resolved': False,
-            'is_win': None,
-            'net_profit': 0.0,
-            'bankroll': self.bankroll,
-            'win_return': df_aggr['win_return'].iloc[-1],
-            'win_rate': wr,
-            'max_drawdown': mdd
+            'target_time': target_time, 'resolved': False, 'is_win': None, 'net_profit': 0.0,
+            'bankroll': self.bankroll, 'win_return': df_aggr['win_return'].iloc[-1],
+            'win_rate': wr, 'max_drawdown': mdd
         }
-        
         df_log = pd.read_csv(self.shadow_log_path) if self.shadow_log_path.exists() else pd.DataFrame()
         df_log = pd.concat([df_log, pd.DataFrame([new_trade])], ignore_index=True)
         df_log.to_csv(self.shadow_log_path, index=False)
-        
-        # Update local history
-        new_hist = pd.DataFrame({
-            'target': [np.nan],
-            'win_return': [df_aggr['win_return'].iloc[-1]]
-        }, index=[pd.to_datetime(new_trade['timestamp'])])
+        new_hist = pd.DataFrame({'target': [np.nan], 'win_return': [df_aggr['win_return'].iloc[-1]]}, index=[pd.to_datetime(new_trade['timestamp'])])
         self.round_history = pd.concat([self.round_history, new_hist])
         logger.info(f"MARKET: {desc[:50]}... | Decision: {decision['decision']} | Price: {execution_price:.4f}")
-
-    def get_performance_stats(self, df=None):
-        if df is None:
-            if not self.shadow_log_path.exists():
-                return 0.0, 0.0
-            try:
-                df = pd.read_csv(self.shadow_log_path)
-            except Exception as e:
-                logger.error(f"Error loading stats: {e}")
-                return 0.0, 0.0
-            
-        try:
-            resolved = df[df['resolved'] == True].copy()
-            if resolved.empty:
-                return 0.0, 0.0
-                
-            # 1. Win Rate
-            win_rate = resolved['is_win'].astype(bool).mean()
-            
-            # 2. Max Drawdown
-            bankroll_history = resolved['bankroll'].values
-            full_history = np.insert(bankroll_history, 0, self.initial_bankroll)
-            
-            peaks = np.maximum.accumulate(full_history)
-            drawdowns = (peaks - full_history) / (peaks + 1e-9)
-            max_dd = np.max(drawdowns)
-            
-            return win_rate, max_dd
-        except Exception as e:
-            logger.error(f"Error calculating stats: {e}")
-            return 0.0, 0.0
 
     def resolve_trades(self):
         if not self.shadow_log_path.exists(): return
@@ -406,13 +318,16 @@ class ShadowTrader:
             if df_log.empty: return
         except: return
 
+        # IMPORTANT: Fix dtypes immediately after read to prevent VPS crash
         df_log['resolved'] = df_log['resolved'].astype(object)
+        if 'is_win' in df_log.columns: df_log['is_win'] = df_log['is_win'].astype(object)
+        for c in ['bankroll', 'net_profit', 'win_rate', 'max_drawdown', 'bet_amount']:
+            if c in df_log.columns: df_log[c] = pd.to_numeric(df_log[c], errors='coerce').astype(float)
         
         now = datetime.now(UTC)
         try:
             curr_p = float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").json()['price'])
         except: return
-        
         updated = False
         for idx, row in df_log.iterrows():
             if row['resolved'] != True and row['decision'] != 'SKIP':
@@ -420,41 +335,33 @@ class ShadowTrader:
                 if now >= target_dt:
                     is_win = (row['decision'] == 'BET_YES' and curr_p > row['entry_price_binance']) or \
                              (row['decision'] == 'BET_NO' and curr_p <= row['entry_price_binance'])
-                    
                     exec_p = row['execution_price']
                     shares = row['bet_amount'] / (exec_p + 1e-9)
-                    
                     if is_win:
                         gross_payoff = shares * 1.0
                         profit = gross_payoff - row['bet_amount']
                         net_profit = profit * (1 - self.config['trade_decision']['polymarket_fee'])
                     else:
                         net_profit = -row['bet_amount']
-                    
                     self.bankroll += net_profit
                     df_log.at[idx, 'resolved'] = True
                     df_log.at[idx, 'is_win'] = bool(is_win)
-                    df_log.at[idx, 'net_profit'] = net_profit
-                    df_log.at[idx, 'bankroll'] = self.bankroll
+                    df_log.at[idx, 'net_profit'] = float(net_profit)
+                    df_log.at[idx, 'bankroll'] = float(self.bankroll)
                     
-                    # Recalculate stats with the newly resolved trade
+                    # Update stats after this resolution
                     wr, mdd = self.get_performance_stats(df_log)
-                    df_log.at[idx, 'win_rate'] = wr
-                    df_log.at[idx, 'max_drawdown'] = mdd
+                    df_log.at[idx, 'win_rate'] = float(wr)
+                    df_log.at[idx, 'max_drawdown'] = float(mdd)
                     
                     updated = True
                     ts = pd.to_datetime(row['timestamp'])
                     if ts in self.round_history.index:
                         self.round_history.at[ts, 'target'] = 1 if is_win else 0
-                    
                     logger.info(f"RESOLVED: {'WIN' if is_win else 'LOSS'} | Net: ${net_profit:+.2f} | Balance: ${self.bankroll:.2f}")
-        
         if updated: 
             df_log.to_csv(self.shadow_log_path, index=False)
             self.save_bankroll()
-            
-            # Log statistik terbaru setelah update
-            # Ambil dari baris terakhir yang baru saja diupdate atau hitung ulang
             wr, mdd = self.get_performance_stats(df_log)
             logger.info(f"PERFORMANCE SUMMARY: WinRate: {wr:.2%} | MaxDD: {mdd:.2%}")
 
@@ -463,7 +370,6 @@ if __name__ == "__main__":
     trader = ShadowTrader(test_mode=is_test)
     logger.info(f"Shadow Trader Mode: {'TEST (2m)' if is_test else 'NORMAL (15m)'}")
     logger.info(f"Current Bankroll: ${trader.bankroll:.2f}")
-    
     while True:
         trader.resolve_trades()
         now = datetime.now(UTC)
