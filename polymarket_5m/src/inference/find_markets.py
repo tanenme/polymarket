@@ -63,14 +63,22 @@ class PolymarketMarketFinder:
                         
                         # Market is valid if it has at least one bid and one ask
                         if bids and asks:
+                            # CLOB API often returns sorted lists, but to be 100% safe, 
+                            # we find the max bid (best price for seller) and min ask (best price for buyer)
+                            bid_prices = [float(b['price']) for b in bids]
+                            ask_prices = [float(ask['price']) for ask in asks]
+                            
+                            best_bid = max(bid_prices)
+                            best_ask = min(ask_prices)
+                            
                             logger.info(f"Successfully discovered active market: {question}")
                             return {
                                 'id': m.get('conditionId'),
                                 'question': question,
                                 'yes_token': yes_token,
                                 'no_token': tokens[1],
-                                'best_bid': float(bids[0]['price']),
-                                'best_ask': float(asks[0]['price']),
+                                'best_bid': best_bid,
+                                'best_ask': best_ask,
                                 'end_date': m.get('endDate')
                             }
             

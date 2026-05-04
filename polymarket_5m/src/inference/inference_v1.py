@@ -65,39 +65,48 @@ class PolymarketPredictor:
         
         return self.calibrator.predict(p_ens)
 
-    def get_trade_decision(self, p_model: float, p_market: float) -> dict:
+    def get_trade_decision(self, p_model: float, best_bid: float, best_ask: float) -> dict:
         """
-        Formula EV: p_model - p_market - fee - margin
+        Formula EV Real:
+        Edge YES = p_model - best_ask - fee - margin
+        Edge NO  = (1 - p_model) - (1 - best_bid) - fee - margin
         """
         fee    = self.config['trade_decision']['polymarket_fee']
         margin = self.config['trade_decision']['model_risk_margin']
         min_ev = self.config['trade_decision']['min_ev_to_trade']
 
+        # Price equivalent for Kelly and EV
+        p_yes = best_ask
+        p_no  = 1 - best_bid
+
         # Edge untuk YES
-        ev_yes = p_model - p_market - fee - margin
+        ev_yes = p_model - p_yes - fee - margin
 
         # Edge untuk NO
         p_model_no  = 1 - p_model
-        p_market_no = 1 - p_market
-        ev_no       = p_model_no - p_market_no - fee - margin
+        ev_no       = p_model_no - p_no - fee - margin
 
         if ev_yes > min_ev and ev_yes >= ev_no:
             decision = 'BET_YES'
             ev = ev_yes
             confidence = p_model
+            execution_price = p_yes
         elif ev_no > min_ev and ev_no > ev_yes:
             decision = 'BET_NO'
             ev = ev_no
             confidence = p_model_no
+            execution_price = p_no
         else:
             decision = 'SKIP'
             ev = max(ev_yes, ev_no)
             confidence = abs(p_model - 0.5)
+            execution_price = (best_bid + best_ask) / 2
 
         # Bet sizing (Kelly)
         bet_size = 0
         if decision != 'SKIP':
-            b = (1 / p_market if decision == 'BET_YES' else 1 / p_market_no) - 1
+            # odds b = (payoff / stake) - 1.Stake is execution_price, payoff is 1.0.
+            b = (1 / execution_price) - 1
             p_win = p_model if decision == 'BET_YES' else p_model_no
             kelly_full = (p_win * b - (1 - p_win)) / (b + 1e-9)
             kelly_frac = kelly_full * self.config['trade_decision']['kelly_fraction']
@@ -109,7 +118,9 @@ class PolymarketPredictor:
             'bet_size': bet_size,
             'confidence': confidence,
             'p_model': p_model,
-            'p_market': p_market
+            'best_bid': best_bid,
+            'best_ask': best_ask,
+            'execution_price': execution_price
         }
 
 if __name__ == "__main__":

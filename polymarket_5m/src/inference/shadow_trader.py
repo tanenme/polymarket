@@ -267,49 +267,90 @@ class ShadowTrader:
         except: return 0.0, 0.0
 
     def run_prediction(self):
-        logger.info(f"Running Prediction ({'TEST' if self.test_mode else 'NORMAL'} MODE)...")
+        logger.info(f"\n" + "="*60)
+        logger.info(f"RUNNING PREDICTION ({'TEST' if self.test_mode else 'NORMAL'} MODE)")
+        logger.info("="*60)
+        
+        # 1. Sync data Binance
         self.sync_data() 
+        
+        # 2. Get Polymarket Data
         best_bid, best_ask, p_market_mid, desc = self.get_polymarket_data()
-        if best_bid == 0.0 or best_ask == 0.0:
-            logger.warning("Invalid market data (0.0). Skipping prediction.")
+        spread = best_ask - best_bid
+        
+        logger.info(f"Market: {desc}")
+        logger.info(f"Price : Bid {best_bid:.4f} | Ask {best_ask:.4f} | Mid {p_market_mid:.4f}")
+        logger.info(f"Spread: {spread:.4f} ({spread*100:.2f}%)")
+        
+        # --- SAFEGUARDS ---
+        if best_bid <= 0.0 or best_ask >= 1.0 or best_ask <= best_bid:
+            logger.warning("Status: REJECTED (Invalid market data / No Liquidity). Skipping.")
             return
+            
+        if spread > 0.05:
+            logger.warning(f"Status: REJECTED (Spread {spread:.4f} > 0.05). Skipping for safety.")
+            return
+        # ------------------
+
+        # 3. Feature Engineering & Prediction
         obi = (best_bid - (1 - best_ask))
         self.buffer_1m.iloc[-1, self.buffer_1m.columns.get_loc('obi_mean')] = obi
+        
         df_1m = self.add_technical_features_v1(self.buffer_1m)
         df_1m = self.add_time_features_v1(df_1m)
         df_aggr = self.aggregate_window_features_v1(df_1m.tail(15))
         df_final = self.add_inter_round_features_v1(df_aggr)
+        
         X = df_final[self.predictor.selected_features]
         p_model = self.predictor.predict_probability(X)[0]
-        decision = self.predictor.get_trade_decision(p_model, p_market_mid)
-        execution_price = 0.0
-        if decision['decision'] == 'BET_YES':
-            execution_price = best_ask
-        elif decision['decision'] == 'BET_NO':
-            execution_price = 1 - best_bid
+        
+        # 4. Decision Logic (EV & Sizing)
+        decision = self.predictor.get_trade_decision(p_model, best_bid, best_ask)
+        
+        logger.info(f"Model Probability (UP): {p_model:.4f}")
+        logger.info(f"Edge/EV Real          : {decision['ev']:.4f}")
+        
         if decision['decision'] == 'SKIP':
-            logger.info(f"Model: {p_model:.4f} | Market: {p_market_mid:.4f} | Decision: SKIP")
+            logger.info("Decision: SKIP (EV does not meet threshold)")
             return
+            
+        execution_price = decision['execution_price']
+        bet_amount = self.bankroll * decision['bet_size']
+        
+        logger.info(f"Decision: {decision['decision']}")
+        logger.info(f"Execution Price: {execution_price:.2f}")
+        logger.info(f"Bet Size (Kelly): {decision['bet_size']:.2%} (${bet_amount:.2f})")
+        
+        # 5. Logging & History
         now_utc = datetime.now(UTC)
         target_mins = 2 if self.test_mode else 15
         target_time = (now_utc + timedelta(minutes=target_mins)).strftime('%Y-%m-%d %H:%M:%S')
-        bet_amount = self.bankroll * decision['bet_size']
+        
         wr, mdd = self.get_performance_stats()
         new_trade = {
             'timestamp': now_utc.strftime('%Y-%m-%d %H:%M:%S'),
-            'p_model': p_model, 'p_market': p_market_mid, 'decision': decision['decision'],
-            'bet_amount': bet_amount, 'execution_price': execution_price,
+            'p_model': p_model, 
+            'p_market': p_market_mid,
+            'decision': decision['decision'],
+            'bet_amount': bet_amount, 
+            'execution_price': execution_price,
             'entry_price_binance': self.buffer_1m['close'].iloc[-1],
             'target_time': target_time, 'resolved': False, 'is_win': None, 'net_profit': 0.0,
             'bankroll': self.bankroll, 'win_return': df_aggr['win_return'].iloc[-1],
             'win_rate': wr, 'max_drawdown': mdd
         }
+        
+        # Append to log file
         df_log = pd.read_csv(self.shadow_log_path) if self.shadow_log_path.exists() else pd.DataFrame()
         df_log = pd.concat([df_log, pd.DataFrame([new_trade])], ignore_index=True)
         df_log.to_csv(self.shadow_log_path, index=False)
+        
+        # Update round history
         new_hist = pd.DataFrame({'target': [np.nan], 'win_return': [df_aggr['win_return'].iloc[-1]]}, index=[pd.to_datetime(new_trade['timestamp'])])
         self.round_history = pd.concat([self.round_history, new_hist])
-        logger.info(f"MARKET: {desc[:50]}... | Decision: {decision['decision']} | Price: {execution_price:.4f}")
+        
+        logger.info("Trade recorded in shadow log.")
+        logger.info("="*60)
 
     def resolve_trades(self):
         if not self.shadow_log_path.exists(): return

@@ -69,7 +69,13 @@ def run_us_session_backtest(config_path: str = None):
     trades = []
     
     for idx, row in test_df.iterrows():
-        decision = predictor.get_trade_decision(row['p_model'], row['p_market'])
+        # Simulate Spread (1.5% - 3.5%)
+        spread = np.random.uniform(0.015, 0.035)
+        p_market_mid = row['p_market']
+        best_bid = p_market_mid - spread/2
+        best_ask = p_market_mid + spread/2
+
+        decision = predictor.get_trade_decision(row['p_model'], best_bid, best_ask)
 
         if decision['decision'] != 'SKIP':
             bet_amount = bankroll * decision['bet_size']
@@ -77,11 +83,11 @@ def run_us_session_backtest(config_path: str = None):
             is_win = (decision['decision'] == 'BET_YES' and row['target'] == 1) or \
                      (decision['decision'] == 'BET_NO' and row['target'] == 0)
 
+            exec_p = decision['execution_price']
             if is_win:
-                # Menghitung profit berdasarkan harga pasar saat itu
-                p_m = row['p_market'] if decision['decision'] == 'BET_YES' else (1 - row['p_market'])
-                gross_profit = bet_amount * (1/p_m - 1)
-                net_profit = gross_profit * (1 - config['trade_decision']['polymarket_fee'])
+                # Menghitung profit berdasarkan harga eksekusi real
+                shares = bet_amount / exec_p
+                net_profit = (shares * 1.0 - bet_amount) * (1 - config['trade_decision']['polymarket_fee'])
                 bankroll += net_profit
             else:
                 net_profit = -bet_amount
@@ -91,7 +97,10 @@ def run_us_session_backtest(config_path: str = None):
                 'round_start': row['round_start'],
                 'decision': decision['decision'],
                 'p_model': row['p_model'],
-                'p_market': row['p_market'],
+                'p_market': p_market_mid,
+                'best_bid': best_bid,
+                'best_ask': best_ask,
+                'execution_price': exec_p,
                 'is_win': is_win,
                 'net_profit': net_profit,
                 'bankroll': bankroll

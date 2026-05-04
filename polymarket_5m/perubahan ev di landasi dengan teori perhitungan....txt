@@ -1,0 +1,138 @@
+﻿Python
+
+
+
+
+import pandas as pd
+import io
+
+shadow_trades_csv = """timestamp,p_model,p_market,decision,bet_amount,entry_price_binance,execution_price,target_time,resolved,is_win,net_profit,bankroll,win_return,win_rate,max_drawdown
+2026-05-03 14:30:04,0.4304538799414348,0.5,BET_NO,2.434114199615668,78693.39,0.99,2026-05-03 14:45:04,True,False,-2.434114199615668,67.56588580038434,-1.27675647831893e-14,0.0,0.3243411419929132
+2026-05-03 15:45:04,0.3967391304347826,0.5,BET_NO,3.378294290019217,78701.77,0.99,2026-05-03 16:00:04,True,True,0.0334416976747661,67.5993274980591,-1.27675647831893e-14,0.5,0.3243411419929132
+2026-05-03 16:00:04,0.2674418604651162,0.5,BET_NO,3.378294290019217,78668.36,0.99,2026-05-03 16:15:04,True,True,0.0334416976747661,67.63276919573386,-1.27675647831893e-14,0.6666666666666666,0.3243411419929132
+"""
+
+try:
+   df_shadow = pd.read_csv(io.StringIO(shadow_trades_csv))
+   print(df_shadow[['decision', 'p_model', 'p_market', 'execution_price', 'bet_amount', 'net_profit']].head())
+except Exception as e:
+   print(f"Error reading shadow log: {e}")
+
+
+Output kode
+  decision   p_model  p_market  execution_price  bet_amount  net_profit
+0   BET_NO  0.430454       0.5             0.99    2.434114   -2.434114
+1   BET_NO  0.396739       0.5             0.99    3.378294    0.033442
+2   BET_NO  0.267442       0.5             0.99    3.378294    0.033442
+
+
+Saya telah menganalisis kode yang Anda lampirkan bersama dengan dua artikel teori payoff tersebut. Teori yang disampaikan dalam artikel [source: 8] sangat krusial dan benar: payoff real di Polymarket harus dihitung berdasarkan eksekusi pada order book (best ask untuk beli YES, best bid untuk beli NO), bukan berdasarkan probabilitas model atau mid-price.
+Berdasarkan analisis silang antara kode dan data shadow_trades.csv yang Anda berikan, saya menemukan bahwa implementasi Anda di shadow_trader.py dan backtest_us_session.py / backtest_v1.py belum sepenuhnya selaras dengan teori tersebut, dan inilah yang menyebabkan hasil evaluasi menjadi bias atau salah.
+Berikut adalah pembedahan detail mengenai letak kesalahan dan bagaimana teori tersebut seharusnya diimplementasikan:
+1. Kesalahan Fatal pada backtest_us_session.py dan backtest_v1.py
+Kedua script backtest ini mensimulasikan market price menggunakan nilai acak (random noise):
+
+
+
+
+Python
+
+
+
+
+# Dari backtest_v1.py
+test_df['p_market'] = 0.5 + np.random.normal(0, 0.02, len(test_df))
+
+Kemudian, saat menghitung profit, mereka menggunakan p_market tersebut sebagai implied probability yang dibayar:
+
+
+Python
+
+
+
+
+p_m = row['p_market'] if decision['decision'] == 'BET_YES' else (1 - row['p_market'])
+gross_profit = bet_amount * (1/p_m - 1)
+
+Kenapa ini salah besar (berdasarkan teori)?
+1. Mengabaikan Spread dan Likuiditas: Harga p_market yang dihasilkan hanyalah sebuah nilai tunggal yang di-random. Di dunia nyata (dan menurut artikel [source: 8]), Anda tidak pernah membeli di harga tengah (p_market). Jika model memutuskan BET_YES, ia harus membeli pada harga ask_yes (harga penawaran terendah). Di Polymarket, ask_yes + ask_no hampir selalu lebih besar dari 1.0 karena adanya spread dan fee.
+
+2. Slippage Diabaikan: Jika Anda bertaruh besar (bet_amount), Anda mungkin akan memakan beberapa tingkat (levels) di buku pesanan (order book), membuat harga rata-rata eksekusi (VWAP eksekusi) menjadi lebih buruk daripada best ask awal. Backtest ini berasumsi Anda bisa mengeksekusi volume tanpa batas pada harga tengah (mid-price).
+
+3. Ilusi EV Positif: Karena model Anda diukur terhadap harga tengah acak tanpa spread atau slippage, ia akan sering menemukan edge (peluang keuntungan) palsu. Inilah mengapa win rate dan equity curve di backtest ini akan terlihat sangat spektakuler, namun gagal total di live market.
+2. Kesalahan Fatal pada shadow_trader.py dan inference_v1.py
+Modul ShadowTrader ini mencoba menghubungkan prediksi model ke pasar yang sesungguhnya (menggunakan API), yang merupakan langkah yang benar. Namun, ada bug logika yang parah dalam implementasinya yang menyebabkan nilai-nilai statis yang merusak perhitungan EV.
+A. Sumber Masalah: p_market dan execution_price Terkunci
+Fungsi get_polymarket_data dalam shadow_trader.py mengambil data dari find_markets.py:
+
+
+Python
+
+
+
+
+# Dari shadow_trader.py
+   def get_polymarket_data(self):
+       market = PolymarketMarketFinder.find_bitcoin_price_market()
+       if market:
+           return market['best_bid'], market['best_ask'], (market['best_bid'] + market['best_ask'])/2, market['question']
+       return 0.0, 0.0, 0.50, "N/A"
+
+Dalam fungsi run_prediction, nilai-nilai ini digunakan untuk menghitung harga eksekusi:
+
+
+Python
+
+
+
+
+        execution_price = 0.0
+       if decision['decision'] == 'BET_YES':
+           execution_price = best_ask
+       elif decision['decision'] == 'BET_NO':
+           execution_price = 1 - best_bid # <- PERHATIKAN INI
+
+Bagaimana ini menciptakan bencana di shadow_trades.csv? Jika PolymarketMarketFinder gagal menemukan pasar yang valid (atau API gagal), ia me-return None. Kemudian get_polymarket_data akan mengembalikan fallback: best_bid = 0.0, best_ask = 0.0, p_market_mid = 0.50. Lalu di run_prediction:
+
+
+   1. Model memprediksi (misal) p_model = 0.26 (Sangat yakin untuk DOWN/NO).
+   2. Keputusan (decision) dihitung berdasarkan p_model vs p_market (0.50). Karena EV terlihat bagus, keputusannya adalah BET_NO.
+
+   3. Karena keputusan adalah BET_NO, execution_price = 1 - best_bid -> 1 - 0.0 = 1.0. (Dalam prakteknya, sistem mungkin membatasi harga agar tidak tepat 1.0, sehingga menjadi 0.99).
+Inilah mengapa di file shadow_trades.csv, p_market selalu 0.5 dan execution_price selalu 0.99 ketika keputusan adalah BET_NO. Anda "tereksekusi" pada fallback value, bukan harga pasar riil.
+B. Kegagalan Logika Perhitungan EV di inference_v1.py
+Dokumen teori Anda [source: 8] menyebutkan:
+"Jangan entry di displayed price/midpoint, karena itu hanya angka tampilan. Saat BUY, gunakan best ask; saat SELL, gunakan best bid."
+
+
+Namun, mari kita lihat fungsi pengambilan keputusan di inference_v1.py:
+
+
+Python
+
+
+
+
+    def get_trade_decision(self, p_model: float, p_market: float) -> dict:
+       # ...
+       ev_yes = p_model - p_market - fee - margin
+       # ...
+
+Fungsi ini menghitung Expected Value (EV) menggunakan p_market (yang dalam konteks pemanggilannya di shadow_trader.py adalah mid-price: (best_bid + best_ask)/2). Ini melanggar prinsip utama dari teori eksekusi yang valid: Anda tidak bisa membeli kontrak YES di mid-price. Anda harus membelinya di best_ask. Membeli di mid-price adalah ilusi. EV nyata selalu lebih buruk (lebih rendah) daripada EV yang dihitung menggunakan mid-price karena adanya spread.
+
+
+Ringkasan Solusi
+Untuk membenarkan semua kesalahan ini agar selaras dengan teori perhitungan payoff real [source: 8], Anda harus menghentikan sistem simulasi ini dan memperbaiki logika berikut:
+      1. Ubah Logika EV di PolymarketPredictor (inference_v1.py):
+Ubah argumen fungsi get_trade_decision agar menerima best_bid dan best_ask alih-alih p_market.
+         * Untuk BET_YES: Harga masuk (entry price) adalah best_ask. EV = p_model - best_ask - fee - margin.
+         * Untuk BET_NO: Harga masuk (entry price) adalah 1 - best_bid. EV = (1 - p_model) - (1 - best_bid) - fee - margin.
+         2. Cegah Eksekusi pada Data Fallback (shadow_trader.py):
+Di dalam run_prediction, Anda harus menggugurkan transaksi (return) jika pasar tidak ditemukan atau jika API mengembalikan 0.0.
+Python
+best_bid, best_ask, p_market_mid, desc = self.get_polymarket_data()
+if best_bid <= 0.0 or best_ask >= 1.0 or (best_ask - best_bid) > 0.05: # Tambahkan perlindungan spread
+   logger.warning(f"Market illiquid / API failed. best_bid: {best_bid}, best_ask: {best_ask}. Skipping prediction.")
+   return
+
+         3. Tinggalkan Random Noise di Backtest (backtest_v1.py & backtest_us_session.py): Jika Anda ingin melakukan backtest yang akurat, Anda tidak bisa mensimulasikan p_market dengan bilangan acak yang tidak mempertimbangkan spread dan harga eksekusi aktual. Backtest ini, dalam bentuknya yang sekarang, tidak berharga untuk menilai profitabilitas sistem Anda di dunia nyata. Anda memerlukan rekaman data order book Polymarket historis yang selaras waktu (time-aligned) dengan data Binance Anda untuk melakukan backtest yang bermakna.
