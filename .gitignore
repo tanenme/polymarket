@@ -1,1 +1,4 @@
 /polymarket_5m/data/raw
+/orderbook-kline-aggtrade/data
+/orderbook-kline-aggtrade/book
+/orderbook-kline-aggtrade/Volume

@@ -74,7 +74,7 @@ def build_target_polymarket_v1(df_1m: pd.DataFrame, config: dict) -> pd.DataFram
     )
 
     # Provenance
-    valid['label_source'] = 'binance_futures_1m_ohlcv'
+    valid['label_source'] = 'bybit_spot_1m_ohlcv'
     valid['label_threshold'] = threshold
     valid['label_version'] = config['project']['version']
 

@@ -1,2 +1,1 @@
-timestamp,p_model,p_market,decision,bet_amount,entry_price_binance,execution_price,target_time,resolved,is_win,net_profit,bankroll,win_return,win_rate,max_drawdown
-2026-05-04 06:15:02,0.26744186046511625,0.545,BET_NO,3.509001678849897,79918.01,0.45999999999999996,2026-05-04 06:30:02,False,,0.0,70.18003357699794,-1.2545520178264269e-14,0.0,0.0
+timestamp,p_model,p_market,decision,bet_amount,entry_price_exchange,execution_price,target_time,resolved,is_win,net_profit,bankroll,win_return,win_rate,max_drawdown

@@ -80,7 +80,7 @@ def compute_sample_weights(train_df: pd.DataFrame, config: dict) -> np.ndarray:
     vol_thresh = np.abs(train_df['future_return']).median()
     weights = np.where(np.abs(train_df['future_return']) >= vol_thresh, w_high, w_low)
 
-    logger.info(f"Sample weights: high={w_high}x, low={w_low}x, vol_threshold={vol_threshold:.5f}")
+    logger.info(f"Sample weights: high={w_high}x, low={w_low}x, vol_threshold={vol_thresh:.5f}")
     return weights
 
 def reduce_features_via_lgbm_v1(X_train, y_train, X_val, y_val, w_train, config):

@@ -8,6 +8,7 @@ import json
 import os
 import talib
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 
@@ -49,8 +50,17 @@ class ShadowTrader:
         self.buffer_1m = pd.DataFrame()
         self.round_history = pd.DataFrame()
         
+        # Buffer for real-time Bybit Orderbook snapshots
+        self.ob_collector_buffer = [] 
+        self.ob_lock = threading.Lock()
+        
+        # Start Background OB Collector (200ms interval to match training data)
+        self.stop_threads = False
+        self.ob_thread = threading.Thread(target=self._ob_collector_loop, daemon=True)
+        self.ob_thread.start()
+        
         # Define Columns
-        self.log_cols = ['timestamp', 'p_model', 'p_market', 'decision', 'bet_amount', 'execution_price', 'entry_price_binance', 'target_time', 'resolved', 'is_win', 'net_profit', 'bankroll', 'win_return', 'win_rate', 'max_drawdown']
+        self.log_cols = ['timestamp', 'p_model', 'p_market', 'decision', 'bet_amount', 'execution_price', 'entry_price_exchange', 'target_time', 'resolved', 'is_win', 'net_profit', 'bankroll', 'win_return', 'win_rate', 'max_drawdown']
         
         # Initialize log if not exists or empty
         if not self.shadow_log_path.exists() or self.shadow_log_path.stat().st_size == 0:
@@ -211,27 +221,128 @@ class ShadowTrader:
             res['past_ret_zscore_8'] = res['past_ret_lag1'] / (res['past_rvol_8'] + 1e-9)
         return res
 
-    def sync_data(self):
-        logger.info("Syncing historical data for 100% consistency...")
-        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=300"
-        df = pd.DataFrame(requests.get(url).json(), columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        for col in ['open', 'high', 'low', 'close', 'volume']: df[col] = df[col].astype(float)
-        tr_url = "https://api.binance.com/api/v3/aggTrades?symbol=BTCUSDT&limit=5000"
-        tr_df = pd.DataFrame(requests.get(tr_url).json())
-        tr_df['T'] = pd.to_datetime(tr_df['T'], unit='ms')
-        tr_df['q'] = tr_df['q'].astype(float)
-        tr_df['buy_vol'] = np.where(tr_df['m'] == False, tr_df['q'], 0)
-        tr_df['sell_vol'] = np.where(tr_df['m'] == True, tr_df['q'], 0)
-        vpin_res = tr_df.set_index('T').resample('1min').apply(lambda x: abs(x['buy_vol'].sum() - x['sell_vol'].sum()) / (x['q'].sum() + 1e-9))
-        vpin_1m = pd.DataFrame(index=vpin_res.index)
-        vpin_1m['vpin_mean'] = vpin_res.values
-        vpin_1m['vpin_std'] = 0.0
-        df = df.join(vpin_1m, how='left').fillna(0)
-        df['obi_mean'], df['obi_std'] = 0.0, 0.0 
-        df['ofi_mean'], df['ofi_std'] = 0.0, 0.0
+    def _ob_collector_loop(self):
+        """Background thread loop for high-frequency OB collection."""
+        logger.info("Starting background Bybit Orderbook collector (200ms)...")
+        while not self.stop_threads:
+            start_t = time.time()
+            self.collect_bybit_orderbook()
+            elapsed = time.time() - start_t
+            sleep_time = max(0.01, 0.2 - elapsed) # Target 200ms
+            time.sleep(sleep_time)
+
+    def collect_bybit_orderbook(self):
+        """Fetches current L1 Bybit Orderbook and stores in memory buffer."""
+        url = "https://api.bybit.com/v5/market/orderbook"
+        params = {"category": "spot", "symbol": "BTCUSDT", "limit": 1}
+        try:
+            resp = requests.get(url, params=params, timeout=2).json()
+            if resp.get('retCode') == 0:
+                res = resp['result']
+                b = res['b'][0] if res['b'] else ['0', '0']
+                a = res['a'][0] if res['a'] else ['0', '0']
+                snapshot = {
+                    'ts': int(res['ts']),
+                    'b0_p': float(b[0]), 'b0_v': float(b[1]),
+                    'a0_p': float(a[0]), 'a0_v': float(a[1])
+                }
+                with self.ob_lock:
+                    self.ob_collector_buffer.append(snapshot)
+                    # Keep last 20 minutes (20 * 60 * 5 = 6000 snapshots)
+                    if len(self.ob_collector_buffer) > 7000:
+                        self.ob_collector_buffer.pop(0)
+        except Exception:
+            pass
+
+    def sync_data(self) -> bool:
+        logger.info("Syncing historical data from BYBIT for 100% consistency...")
+        # 1. Fetch Klines (Spot)
+        klines_url = "https://api.bybit.com/v5/market/kline"
+        params = {"category": "spot", "symbol": "BTCUSDT", "interval": "1", "limit": 300}
+        try:
+            resp = requests.get(klines_url, params=params, timeout=10).json()
+            if resp.get('retCode') == 0:
+                klines_list = resp['result']['list']
+                df = pd.DataFrame(klines_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='ms')
+                df.set_index('timestamp', inplace=True)
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                df = df.sort_index()
+            else:
+                logger.error(f"Failed to fetch klines from Bybit: {resp.get('retMsg')}")
+                return False
+        except Exception as e:
+            logger.error(f"Bybit API Error (Klines): {e}")
+            return False
+
+        # 2. Fetch Recent Trades (Spot) -> VPIN
+        trades_url = "https://api.bybit.com/v5/market/recent-trade"
+        params = {"category": "spot", "symbol": "BTCUSDT", "limit": 1000}
+        try:
+            resp = requests.get(trades_url, params=params, timeout=10).json()
+            if resp.get('retCode') == 0:
+                trades_list = resp['result']['list']
+                tr_df = pd.DataFrame(trades_list)
+                tr_df['T'] = pd.to_datetime(tr_df['time'].astype(int), unit='ms')
+                tr_df['q'] = tr_df['size'].astype(float)
+                tr_df['is_buyer_maker'] = tr_df['side'] == 'Sell'
+                
+                tr_df['buy_vol'] = np.where(tr_df['is_buyer_maker'] == False, tr_df['q'], 0)
+                tr_df['sell_vol'] = np.where(tr_df['is_buyer_maker'] == True, tr_df['q'], 0)
+                
+                vpin_res = tr_df.set_index('T').resample('1min').apply(
+                    lambda x: abs(x['buy_vol'].sum() - x['sell_vol'].sum()) / (x['q'].sum() + 1e-9)
+                )
+                vpin_1m = pd.DataFrame(index=vpin_res.index)
+                vpin_1m['vpin_mean'] = vpin_res.values
+                vpin_1m['vpin_std'] = 0.0
+                
+                df = df.join(vpin_1m, how='left').fillna(0)
+            else:
+                logger.warning(f"Failed to fetch trades from Bybit: {resp.get('retMsg')}")
+                df['vpin_mean'], df['vpin_std'] = 0.0, 0.0
+        except Exception as e:
+            logger.warning(f"Bybit API Error (Trades): {e}")
+            df['vpin_mean'], df['vpin_std'] = 0.0, 0.0
+
+        # 3. Process Bybit Orderbook Buffer -> OBI, OFI
+        with self.ob_lock:
+            local_ob_buffer = list(self.ob_collector_buffer)
+            
+        if local_ob_buffer:
+            ob_df = pd.DataFrame(local_ob_buffer)
+            ob_df['timestamp'] = pd.to_datetime(ob_df['ts'], unit='ms')
+            ob_df.set_index('timestamp', inplace=True)
+            
+            # OBI calculation
+            ob_df['obi'] = (ob_df['b0_v'] - ob_df['a0_v']) / (ob_df['b0_v'] + ob_df['a0_v'] + 1e-9)
+            
+            # OFI calculation
+            b_p, b_v = ob_df['b0_p'], ob_df['b0_v']
+            a_p, a_v = ob_df['a0_p'], ob_df['a0_v']
+            
+            db = np.where(b_p > b_p.shift(1), b_v,
+                 np.where(b_p < b_p.shift(1), -b_v.shift(1),
+                 b_v - b_v.shift(1)))
+            da = np.where(a_p < a_p.shift(1), a_v,
+                 np.where(a_p > a_p.shift(1), -a_v.shift(1),
+                 a_v - a_v.shift(1)))
+            
+            ob_df['ofi'] = (pd.Series(db - da, index=ob_df.index).fillna(0)) / (b_v + a_v + 1e-9)
+            
+            # Resample to 1min to match klines
+            micro_ob = ob_df[['obi', 'ofi']].resample('1min').agg(['mean', 'std'])
+            micro_ob.columns = [f"{c[0]}_{c[1]}" for c in micro_ob.columns]
+            
+            df = df.join(micro_ob, how='left').fillna(0)
+        else:
+            # Fallback if buffer is empty
+            df['obi_mean'], df['obi_std'] = 0.0, 0.0 
+            df['ofi_mean'], df['ofi_std'] = 0.0, 0.0
+            
         self.buffer_1m = df
+        return True
 
     def get_polymarket_data(self):
         """Discovers active 15m BTC market using the centralized Finder."""
@@ -271,8 +382,14 @@ class ShadowTrader:
         logger.info(f"RUNNING PREDICTION ({'TEST' if self.test_mode else 'NORMAL'} MODE)")
         logger.info("="*60)
         
-        # 1. Sync data Binance
-        self.sync_data() 
+        # 1. Sync data Bybit
+        if not self.sync_data():
+            logger.error("Status: ABORTED (Could not sync data from Bybit).")
+            return
+            
+        if self.buffer_1m.empty:
+            logger.error("Status: ABORTED (Buffer is empty after sync).")
+            return
         
         # 2. Get Polymarket Data
         best_bid, best_ask, p_market_mid, desc = self.get_polymarket_data()
@@ -293,8 +410,7 @@ class ShadowTrader:
         # ------------------
 
         # 3. Feature Engineering & Prediction
-        obi = (best_bid - (1 - best_ask))
-        self.buffer_1m.iloc[-1, self.buffer_1m.columns.get_loc('obi_mean')] = obi
+        # OBI/OFI already populated from Bybit in sync_data()
         
         df_1m = self.add_technical_features_v1(self.buffer_1m)
         df_1m = self.add_time_features_v1(df_1m)
@@ -334,7 +450,7 @@ class ShadowTrader:
             'decision': decision['decision'],
             'bet_amount': bet_amount, 
             'execution_price': execution_price,
-            'entry_price_binance': self.buffer_1m['close'].iloc[-1],
+            'entry_price_exchange': self.buffer_1m['close'].iloc[-1],
             'target_time': target_time, 'resolved': False, 'is_win': None, 'net_profit': 0.0,
             'bankroll': self.bankroll, 'win_return': df_aggr['win_return'].iloc[-1],
             'win_rate': wr, 'max_drawdown': mdd
@@ -367,15 +483,23 @@ class ShadowTrader:
         
         now = datetime.now(UTC)
         try:
-            curr_p = float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").json()['price'])
+            # Bybit V5 Tickers
+            ticker_url = "https://api.bybit.com/v5/market/tickers"
+            params = {"category": "spot", "symbol": "BTCUSDT"}
+            resp = requests.get(ticker_url, params=params, timeout=10).json()
+            if resp.get('retCode') == 0:
+                curr_p = float(resp['result']['list'][0]['lastPrice'])
+            else:
+                return
         except: return
         updated = False
         for idx, row in df_log.iterrows():
             if row['resolved'] != True and row['decision'] != 'SKIP':
                 target_dt = datetime.strptime(row['target_time'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=UTC)
                 if now >= target_dt:
-                    is_win = (row['decision'] == 'BET_YES' and curr_p > row['entry_price_binance']) or \
-                             (row['decision'] == 'BET_NO' and curr_p <= row['entry_price_binance'])
+                    is_win = (row['decision'] == 'BET_YES' and curr_p > row['entry_price_exchange']) or \
+                             (row['decision'] == 'BET_NO' and curr_p <= row['entry_price_exchange'])
+
                     exec_p = row['execution_price']
                     shares = row['bet_amount'] / (exec_p + 1e-9)
                     if is_win:
@@ -413,9 +537,10 @@ if __name__ == "__main__":
     logger.info(f"Current Bankroll: ${trader.bankroll:.2f}")
     while True:
         trader.resolve_trades()
+        
         now = datetime.now(UTC)
         interval = 2 if is_test else 15
         if now.minute % interval == 0 and now.second < 10:
             trader.run_prediction()
             time.sleep(20)
-        time.sleep(5)
+        time.sleep(1) # Check resolution every second

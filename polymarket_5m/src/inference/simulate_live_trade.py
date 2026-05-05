@@ -24,8 +24,8 @@ def run_imaginary_simulation():
     print("SIMULASI TRADE IMAJINER (REAL-TIME FEATURES + LIVE ORDERBOOK)")
     print("="*60)
     
-    # 2. Sync data Binance terbaru untuk generate features
-    print("[1/4] Mengambil data Binance (BTCUSDT) untuk input model...")
+    # 2. Sync data Bybit terbaru untuk generate features
+    print("[1/4] Mengambil data Bybit (BTCUSDT) untuk input model...")
     trader.sync_data() # Mengambil klines & aggTrades terbaru
     
     # 3. Ambil data Order Book live

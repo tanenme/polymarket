@@ -119,7 +119,7 @@ kode tersebut SALAH, bukan hanya suboptimal.
 ### 1.1 Dataset Aktual
 
 ```
-Sumber data    : Binance Futures WebSocket (aggTrades + OrderBook)
+Sumber data    : Bybit Spot API/Archive (aggTrades + OrderBook)
 Symbol         : BTCUSDT
 Periode        : 29 April 2025 → 16 April 2026
 Total hari     : ~352 hari
@@ -151,7 +151,7 @@ Coverage aktual yang diobservasi: 44% (MASALAH UTAMA)
 │   │   ├── aggtrades/             # Raw aggTrades parquet per hari
 │   │   │   ├── 20250429_aggtrades.parquet
 │   │   │   └── ...
-│   │   └── historical_1m_klines.parquet  # OHLCV 1m dari Binance
+│   │   └── historical_1m_klines.parquet  # OHLCV 1m dari Bybit
 │   ├── interim/                   # Data intermediate (bisa dihapus)
 │   │   └── daily_obi/             # OBI per hari sebelum merge
 │   ├── features/
@@ -564,7 +564,7 @@ def build_target_polymarket_5m(df_1m: pd.DataFrame, config: dict) -> pd.DataFram
     )
 
     # Provenance
-    valid['label_source'] = 'binance_futures_1m_ohlcv'
+    valid['label_source'] = 'bybit_spot_1m_ohlcv'
     valid['label_threshold'] = threshold
     valid['label_version'] = config['version']
 
