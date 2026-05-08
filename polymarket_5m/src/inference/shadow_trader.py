@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 class ShadowTrader:
-    def __init__(self, config_path: str = None, test_mode: bool = False):
+    def __init__(self, config_path: str = None, test_mode: bool = False, forced_threshold: float = None):
         if config_path is None:
             config_path = str(PROJECT_ROOT / "config.yaml")
             
@@ -32,6 +32,7 @@ class ShadowTrader:
             self.config = yaml.safe_load(f)
             
         self.test_mode = test_mode
+        self.forced_threshold = forced_threshold
         
         # Resolve artifacts path
         artifacts_rel = self.config.get('paths', {}).get('models', {}).get('artifacts', "models/artifacts")
@@ -143,6 +144,21 @@ class ShadowTrader:
         df['minutes_since_roll'] = ((ts.hour % 8) * 60 + ts.minute).astype(float)
         return df
 
+    def add_oi_features_v1(self, df_base: pd.DataFrame, df_oi: pd.DataFrame) -> pd.DataFrame:
+        if df_oi.empty: return pd.DataFrame(index=df_base.index)
+        # Match training: reindex 5m OI to 1m base and ffill
+        oi_1m = df_oi.set_index('timestamp')['openInterest'].reindex(df_base.index).ffill()
+        res = pd.DataFrame(index=df_base.index)
+        res['oi_change_15m'] = oi_1m.pct_change(15)
+        res['oi_velocity'] = oi_1m.diff() / (oi_1m.shift(1) + 1e-9)
+        res['oi_relative_std'] = oi_1m.rolling(15).std() / (oi_1m.rolling(15).mean() + 1e-9)
+        oi_ma_1h = oi_1m.rolling(60).mean()
+        res['oi_momentum'] = (oi_1m - oi_ma_1h) / (oi_ma_1h + 1e-9)
+        if 'close' in df_base.columns:
+            price_change = df_base['close'].pct_change(1)
+            res['oi_price_interaction'] = price_change * res['oi_velocity']
+        return res
+
     def aggregate_window_features_v1(self, df_full: pd.DataFrame) -> pd.DataFrame:
         config = self.config
         time_like_cols = set(config['features']['time_like_cols'])
@@ -172,7 +188,7 @@ class ShadowTrader:
             }, index=price_first.index)
             parts.append(win_ret)
         df_aggr = pd.concat(parts, axis=1)
-        for col in ['rsi_14', 'ema_dist_21', 'vwap_dev_norm']:
+        for col in ['rsi_14', 'ema_dist_21', 'vwap_dev_norm', 'oi_velocity']:
             if col in df.columns:
                 df['tick_idx'] = df.groupby('round_label').cumcount()
                 df['win_size'] = df.groupby('round_label')['tick_idx'].transform('max')
@@ -276,7 +292,26 @@ class ShadowTrader:
             logger.error(f"Bybit API Error (Klines): {e}")
             return False
 
-        # 2. Fetch Recent Trades (Spot) -> VPIN
+        # 2. Fetch Open Interest (Linear/Perp)
+        oi_url = "https://api.bybit.com/v5/market/open-interest"
+        params = {"category": "linear", "symbol": "BTCUSDT", "intervalTime": "5min", "limit": 200}
+        try:
+            resp = requests.get(oi_url, params=params, timeout=10).json()
+            if resp.get('retCode') == 0:
+                oi_list = resp['result']['list']
+                oi_df = pd.DataFrame(oi_list)
+                oi_df['timestamp'] = pd.to_datetime(oi_df['timestamp'].astype(int), unit='ms')
+                oi_df['openInterest'] = oi_df['openInterest'].astype(float)
+                
+                # Add OI features
+                oi_feats = self.add_oi_features_v1(df, oi_df)
+                df = pd.concat([df, oi_feats], axis=1).ffill().fillna(0)
+            else:
+                logger.warning(f"Failed to fetch OI from Bybit: {resp.get('retMsg')}")
+        except Exception as e:
+            logger.warning(f"Bybit API Error (OI): {e}")
+
+        # 3. Fetch Recent Trades (Spot) -> VPIN
         trades_url = "https://api.bybit.com/v5/market/recent-trade"
         params = {"category": "spot", "symbol": "BTCUSDT", "limit": 1000}
         try:
@@ -420,6 +455,13 @@ class ShadowTrader:
         X = df_final[self.predictor.selected_features]
         p_model = self.predictor.predict_probability(X)[0]
         
+        # --- MANUAL THRESHOLD FILTER ---
+        confidence = max(p_model, 1 - p_model)
+        if self.forced_threshold and confidence < self.forced_threshold:
+            logger.info(f"Status: SKIP (Confidence {confidence:.4f} < Manual Threshold {self.forced_threshold})")
+            return
+        # -------------------------------
+
         # 4. Decision Logic (EV & Sizing)
         decision = self.predictor.get_trade_decision(p_model, best_bid, best_ask)
         
@@ -531,15 +573,25 @@ class ShadowTrader:
             logger.info(f"PERFORMANCE SUMMARY: WinRate: {wr:.2%} | MaxDD: {mdd:.2%}")
 
 if __name__ == "__main__":
-    is_test = "--test" in sys.argv
-    trader = ShadowTrader(test_mode=is_test)
-    logger.info(f"Shadow Trader Mode: {'TEST (2m)' if is_test else 'NORMAL (15m)'}")
+    import argparse
+    parser = argparse.ArgumentParser(description="Shadow Trader for Polymarket BTC 15m")
+    parser.add_argument("--test", action="store_true", help="Run in test mode (2m rounds)")
+    parser.add_argument("--threshold", "--t", type=float, help="Manual probability threshold (e.g. 0.585)")
+    args = parser.parse_args()
+    
+    trader = ShadowTrader(test_mode=args.test, forced_threshold=args.threshold)
+    
+    logger.info(f"Shadow Trader Mode: {'TEST (2m)' if args.test else 'NORMAL (15m)'}")
+    if args.threshold:
+        logger.info(f"Manual Threshold Applied: {args.threshold}")
+    
     logger.info(f"Current Bankroll: ${trader.bankroll:.2f}")
+    
     while True:
         trader.resolve_trades()
         
         now = datetime.now(UTC)
-        interval = 2 if is_test else 15
+        interval = 2 if args.test else 15
         if now.minute % interval == 0 and now.second < 10:
             trader.run_prediction()
             time.sleep(20)

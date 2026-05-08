@@ -64,10 +64,13 @@ def load_and_validate_data_v1(features_path: str, config: dict) -> pd.DataFrame:
     return df
 
 def is_valid_feature(col_name: str, config: dict) -> bool:
-    exclude = set(config['features']['exclude_cols'])
+    exclude = config['features']['exclude_cols']
     price_abs = set(config['features']['price_absolute_cols'])
     
-    if col_name in exclude: return False
+    # Check if col_name starts with any string in exclude list
+    if any(col_name.startswith(ex) for ex in exclude):
+        return False
+        
     if col_name in price_abs: return False
     if col_name.startswith('snap_') and any(p in col_name for p in price_abs): return False
     
@@ -129,6 +132,7 @@ def optimize_catboost(X_train, y_train, X_val, y_val, w_train, config):
             'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', *cb_cfg['optuna_search_space']['min_data_in_leaf']),
             'learning_rate': trial.suggest_float('learning_rate', *cb_cfg['optuna_search_space']['learning_rate'], log=True),
             'subsample': trial.suggest_float('subsample', *cb_cfg['optuna_search_space']['subsample']),
+            'max_ctr_complexity': 1, # Limit feature interaction complexity to reduce overfitting
             'verbose': False
         }
         
@@ -165,6 +169,7 @@ def train_final_models(X_train, y_train, X_val, y_val, w_train, best_params_cb, 
         'loss_function': cb_cfg['loss_function'],
         'eval_metric': cb_cfg['eval_metric'],
         'random_seed': cb_cfg['random_seed'],
+        'max_ctr_complexity': 1,
         **best_params_cb,
         'verbose': 500
     }

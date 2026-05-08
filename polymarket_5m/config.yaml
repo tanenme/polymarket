@@ -15,6 +15,8 @@ paths:
     orderbook: "data/raw/orderbook"
     aggtrades: "data/raw/aggtrades"
     klines_1m: "data/raw/historical_1m_klines.parquet"
+    oi: "data/raw/oi"
+    liquidations: "data/raw/liquidations"
     interim: "data/interim"
     features_v1: "data/features/v1"
     labels: "data/labels"
@@ -77,6 +79,7 @@ features:
     - "volume_sum"
     - "initial_price"
     - "final_price"
+    - "past_" # Pruning: Inter-round lag features added too much noise
 
   target_n_features: 70       # Setelah feature reduction via LightGBM
   nan_threshold: 0.30         # Buang feature jika NaN > 30%
@@ -116,13 +119,13 @@ training:
     # rsm: TIDAK ADA DI SINI — tidak didukung GPU + Logloss
     # Parameter yang di-tune via Optuna:
     optuna_search_space:
-      depth: [2, 4]            # Pruned: Shallower trees for better generalization
-      l2_leaf_reg: [200, 2000] # Pruned: Massive regularization
-      random_strength: [1.0, 20.0]
-      min_data_in_leaf: [1000, 5000] # Pruned: Require huge support per split
-      learning_rate: [0.0005, 0.01]  # Pruned: Very slow, careful learning
+      depth: [2, 3]            # Pruned: Shallower trees for better generalization
+      l2_leaf_reg: [1000, 10000] # Increased for massive regularization
+      random_strength: [1.0, 30.0]
+      min_data_in_leaf: [5000, 10000] # Increased: Require huge support per split
+      learning_rate: [0.00001, 0.0001] # Slower, more careful learning
       max_bin: [48, 128]
-      subsample: [0.5, 0.85]
+      subsample: [0.5, 0.8]
     # Fixed per trial
     iterations_per_trial: 2000
     early_stopping_per_trial: 100
@@ -171,7 +174,7 @@ training:
     direction: "maximize"
     sampler: "TPE"
     seed: 42
-    overfit_gap_allowed: 0.03  # Penalti overfit = max(0, gap - 0.03) × 5.0
+    overfit_gap_allowed: 0.02  # Reduced: be more strict about overfitting
     prob_spread_bonus_weight: 5.0
     prob_spread_max_bonus: 0.03
 
