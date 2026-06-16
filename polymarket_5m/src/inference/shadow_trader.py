@@ -495,20 +495,13 @@ class ShadowTrader:
             )
             return
 
-        X = df_final[self.predictor.selected_features]
+        X = df_final[self.predictor.selected_features].copy()
 
-        # GUARD: cek tidak ada NaN/inf di fitur (data live belum matang).
-        # Kolom inter-round (past_*) memang NaN di awal sesi -> diperbolehkan
-        # (model di-train dgn invalidasi serupa). Sisanya WAJIB valid.
-        non_lag = [f for f in self.predictor.selected_features if not f.startswith('past_')]
-        bad = X[non_lag].replace([np.inf, -np.inf], np.nan).isna().any(axis=1).iloc[-1]
-        if bad:
-            nan_cols = X[non_lag].columns[X[non_lag].replace([np.inf, -np.inf], np.nan).isna().iloc[-1]].tolist()
-            logger.warning(
-                f"Status: SKIP (fitur mengandung NaN/inf, data live belum matang). "
-                f"Contoh: {nan_cols[:5]}{'...' if len(nan_cols) > 5 else ''}"
-            )
-            return
+        # NaN diizinkan: model (CatBoost/LGBM) di-train DENGAN NaN dan
+        # menanganinya secara native (61/70 fitur punya NaN di data training,
+        # mis. win_std_* di tepi window). Yang berbahaya hanya inf -> ubah ke
+        # NaN supaya model memperlakukannya sebagai missing, bukan nilai rusak.
+        X = X.replace([np.inf, -np.inf], np.nan)
 
         p_model = self.predictor.predict_probability(X)[0]
         
