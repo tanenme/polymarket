@@ -9,6 +9,7 @@ import os
 import talib
 import sys
 import threading
+import importlib.util
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 
@@ -22,6 +23,14 @@ logger = logging.getLogger(__name__)
 
 # Dynamically find project root (assuming script is in src/inference/shadow_trader.py)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Import feature engineering module (filename starts with digit -> importlib).
+# CRITICAL: live features must be IDENTICAL to training, so we reuse the exact
+# same functions instead of reimplementing them here.
+_fe_path = PROJECT_ROOT / "src/features/02_feature_engineering.py"
+_fe_spec = importlib.util.spec_from_file_location("feature_engineering_v1", _fe_path)
+fe = importlib.util.module_from_spec(_fe_spec)
+_fe_spec.loader.exec_module(fe)
 
 class ShadowTrader:
     def __init__(self, config_path: str = None, test_mode: bool = False, forced_threshold: float = None):
@@ -255,23 +264,27 @@ class ShadowTrader:
             time.sleep(sleep_time)
 
     def collect_bybit_orderbook(self):
-        """Fetches current L1 Bybit Orderbook and stores in memory buffer."""
+        """Fetches L50 Bybit Orderbook and stores in memory buffer.
+
+        Stores raw bids/asks as JSON strings (same schema as the training
+        orderbook parquet) so we can reuse the exact training feature funcs.
+        """
         url = "https://api.bybit.com/v5/market/orderbook"
-        params = {"category": "spot", "symbol": "BTCUSDT", "limit": 1}
+        params = {"category": "spot", "symbol": "BTCUSDT", "limit": 50}
         try:
             resp = requests.get(url, params=params, timeout=2).json()
             if resp.get('retCode') == 0:
                 res = resp['result']
-                b = res['b'][0] if res['b'] else ['0', '0']
-                a = res['a'][0] if res['a'] else ['0', '0']
+                # Bybit returns [["price","qty"], ...]; training parquet stores
+                # the same nested-list JSON in 'bids'/'asks' columns.
                 snapshot = {
-                    'ts': int(res['ts']),
-                    'b0_p': float(b[0]), 'b0_v': float(b[1]),
-                    'a0_p': float(a[0]), 'a0_v': float(a[1])
+                    'timestamp_ms': int(res['ts']),
+                    'bids': json.dumps(res.get('b', [])),
+                    'asks': json.dumps(res.get('a', [])),
                 }
                 with self.ob_lock:
                     self.ob_collector_buffer.append(snapshot)
-                    # Keep last 20 minutes (20 * 60 * 5 = 6000 snapshots)
+                    # Keep ~20 minutes (200ms cadence -> ~6000 snapshots)
                     if len(self.ob_collector_buffer) > 7000:
                         self.ob_collector_buffer.pop(0)
         except Exception:
@@ -307,18 +320,20 @@ class ShadowTrader:
             if resp.get('retCode') == 0:
                 oi_list = resp['result']['list']
                 oi_df = pd.DataFrame(oi_list)
-                oi_df['timestamp'] = pd.to_datetime(oi_df['timestamp'].astype(int), unit='ms')
+                # Training's add_oi_features_v1 expects a 'datetime' column
+                oi_df['datetime'] = pd.to_datetime(oi_df['timestamp'].astype(int), unit='ms')
                 oi_df['openInterest'] = oi_df['openInterest'].astype(float)
-                
-                # Add OI features
-                oi_feats = self.add_oi_features_v1(df, oi_df)
+
+                # Reuse training OI feature func for full parity (oi_momentum,
+                # oi_change_5m/15m/1h, oi_acceleration, oi_zscore_24h, etc.)
+                oi_feats = fe.add_oi_features_v1(df, oi_df)
                 df = pd.concat([df, oi_feats], axis=1).ffill().fillna(0)
             else:
                 logger.warning(f"Failed to fetch OI from Bybit: {resp.get('retMsg')}")
         except Exception as e:
             logger.warning(f"Bybit API Error (OI): {e}")
 
-        # 3. Fetch Recent Trades (Spot) -> VPIN
+        # 3. Fetch Recent Trades (Spot) -> VPIN + Taker Flow (reuse training funcs)
         trades_url = "https://api.bybit.com/v5/market/recent-trade"
         params = {"category": "spot", "symbol": "BTCUSDT", "limit": 1000}
         try:
@@ -326,63 +341,53 @@ class ShadowTrader:
             if resp.get('retCode') == 0:
                 trades_list = resp['result']['list']
                 tr_df = pd.DataFrame(trades_list)
-                tr_df['T'] = pd.to_datetime(tr_df['time'].astype(int), unit='ms')
-                tr_df['q'] = tr_df['size'].astype(float)
+                # Build the exact schema compute_vpin/taker expect:
+                # index=datetime, cols: qty, price, is_buyer_maker
+                tr_df.index = pd.to_datetime(tr_df['time'].astype(int), unit='ms')
+                tr_df['qty'] = tr_df['size'].astype(float)
+                tr_df['price'] = tr_df['price'].astype(float)
                 tr_df['is_buyer_maker'] = tr_df['side'] == 'Sell'
-                
-                tr_df['buy_vol'] = np.where(tr_df['is_buyer_maker'] == False, tr_df['q'], 0)
-                tr_df['sell_vol'] = np.where(tr_df['is_buyer_maker'] == True, tr_df['q'], 0)
-                
-                vpin_res = tr_df.set_index('T').resample('1min').apply(
-                    lambda x: abs(x['buy_vol'].sum() - x['sell_vol'].sum()) / (x['q'].sum() + 1e-9)
-                )
-                vpin_1m = pd.DataFrame(index=vpin_res.index)
-                vpin_1m['vpin_mean'] = vpin_res.values
-                vpin_1m['vpin_std'] = 0.0
-                
-                df = df.join(vpin_1m, how='left').fillna(0)
+                tr_df = tr_df.sort_index()
+
+                # VPIN (training: resample 1min ['mean','std'])
+                df_vpin = fe.compute_vpin_correct(tr_df)
+                df_vpin.index = tr_df.index
+                micro_tr = df_vpin.resample('1min').agg(['mean', 'std'])
+                micro_tr.columns = [f"{c[0]}_{c[1]}" for c in micro_tr.columns]
+
+                # Taker flow features (training: already 1min)
+                df_taker = fe.compute_taker_flow_features_v2(tr_df)
+                micro_tr = micro_tr.join(df_taker, how='outer')
+
+                df = df.join(micro_tr, how='left').fillna(0)
             else:
                 logger.warning(f"Failed to fetch trades from Bybit: {resp.get('retMsg')}")
-                df['vpin_mean'], df['vpin_std'] = 0.0, 0.0
         except Exception as e:
             logger.warning(f"Bybit API Error (Trades): {e}")
-            df['vpin_mean'], df['vpin_std'] = 0.0, 0.0
 
-        # 3. Process Bybit Orderbook Buffer -> OBI, OFI
+        # 4. Process Bybit L50 Orderbook Buffer -> full LOB + OBI + OFI
+        #    (reuse the SAME training functions for 100% feature parity)
         with self.ob_lock:
             local_ob_buffer = list(self.ob_collector_buffer)
-            
+
         if local_ob_buffer:
-            ob_df = pd.DataFrame(local_ob_buffer)
-            ob_df['timestamp'] = pd.to_datetime(ob_df['ts'], unit='ms')
-            ob_df.set_index('timestamp', inplace=True)
-            
-            # OBI calculation
-            ob_df['obi'] = (ob_df['b0_v'] - ob_df['a0_v']) / (ob_df['b0_v'] + ob_df['a0_v'] + 1e-9)
-            
-            # OFI calculation
-            b_p, b_v = ob_df['b0_p'], ob_df['b0_v']
-            a_p, a_v = ob_df['a0_p'], ob_df['a0_v']
-            
-            db = np.where(b_p > b_p.shift(1), b_v,
-                 np.where(b_p < b_p.shift(1), -b_v.shift(1),
-                 b_v - b_v.shift(1)))
-            da = np.where(a_p < a_p.shift(1), a_v,
-                 np.where(a_p > a_p.shift(1), -a_v.shift(1),
-                 a_v - a_v.shift(1)))
-            
-            ob_df['ofi'] = (pd.Series(db - da, index=ob_df.index).fillna(0)) / (b_v + a_v + 1e-9)
-            
-            # Resample to 1min to match klines
-            micro_ob = ob_df[['obi', 'ofi']].resample('1min').agg(['mean', 'std'])
-            micro_ob.columns = [f"{c[0]}_{c[1]}" for c in micro_ob.columns]
-            
-            df = df.join(micro_ob, how='left').fillna(0)
-        else:
-            # Fallback if buffer is empty
-            df['obi_mean'], df['obi_std'] = 0.0, 0.0 
-            df['ofi_mean'], df['ofi_std'] = 0.0, 0.0
-            
+            try:
+                ob_df = pd.DataFrame(local_ob_buffer)
+                ob_df['timestamp'] = pd.to_datetime(ob_df['timestamp_ms'], unit='ms')
+                ob_df = ob_df.set_index('timestamp').sort_index()
+                # Training resamples OB to 5s before computing features
+                ob_df = ob_df.resample('5s').last().dropna(subset=['bids', 'asks'])
+
+                df_lob = fe.compute_orderbook_features_v2(ob_df)
+                df_obi = fe.compute_obi_v1(ob_df)
+                df_ofi = fe.compute_ofi_v1(ob_df)
+                micro_ob = pd.concat([df_lob, df_obi, df_ofi], axis=1).resample('1min').agg(['mean', 'std', 'last'])
+                micro_ob.columns = [f"{c[0]}_{c[1]}" for c in micro_ob.columns]
+
+                df = df.join(micro_ob, how='left').ffill().fillna(0)
+            except Exception as e:
+                logger.warning(f"Orderbook feature error: {e}")
+
         self.buffer_1m = df
         return True
 
@@ -423,12 +428,26 @@ class ShadowTrader:
         logger.info(f"\n" + "="*60)
         logger.info(f"RUNNING PREDICTION ({'TEST' if self.test_mode else 'NORMAL'} MODE)")
         logger.info("="*60)
-        
+
+        # GUARD: pastikan buffer OB sudah cukup terisi sebelum prediksi.
+        # Window fitur = 15 menit. OB @200ms idealnya ~4500 snapshot/15m.
+        # Minimal 12 menit data (~3600 snapshot) agar fitur OB stabil & valid.
+        MIN_OB_SNAPSHOTS = 3600
+        with self.ob_lock:
+            ob_count = len(self.ob_collector_buffer)
+        if ob_count < MIN_OB_SNAPSHOTS:
+            mins = ob_count * 0.2 / 60.0
+            logger.warning(
+                f"Status: SKIP (buffer OB belum siap: {ob_count}/{MIN_OB_SNAPSHOTS} snapshot, ~{mins:.1f} menit). "
+                f"Tunggu collector mengisi window 15 menit sebelum taruhan."
+            )
+            return
+
         # 1. Sync data Bybit
         if not self.sync_data():
             logger.error("Status: ABORTED (Could not sync data from Bybit).")
             return
-            
+
         if self.buffer_1m.empty:
             logger.error("Status: ABORTED (Buffer is empty after sync).")
             return
@@ -452,14 +471,39 @@ class ShadowTrader:
         # ------------------
 
         # 3. Feature Engineering & Prediction
-        # OBI/OFI already populated from Bybit in sync_data()
-        
-        df_1m = self.add_technical_features_v1(self.buffer_1m)
-        df_1m = self.add_time_features_v1(df_1m)
-        df_aggr = self.aggregate_window_features_v1(df_1m.tail(15))
+        # Use the EXACT training functions for technical/time/aggregate so the
+        # live feature columns match the trained model 1:1. Inter-round features
+        # stay local because they depend on live round_history.
+        df_1m = fe.add_technical_features_v1(self.buffer_1m)
+        df_1m = fe.add_time_features_v1(df_1m)
+        df_aggr = fe.aggregate_window_features_v1(df_1m.tail(15), self.config)
         df_final = self.add_inter_round_features_v1(df_aggr)
-        
+
+        # GUARD: jangan taruhan kalau fitur belum 100% siap.
+        # Prediksi dgn fitur di-fill 0 = sinyal tidak valid -> bisa rugi.
+        missing = [f for f in self.predictor.selected_features if f not in df_final.columns]
+        if missing:
+            logger.warning(
+                f"Status: SKIP (fitur belum siap: {len(missing)}/{len(self.predictor.selected_features)} hilang). "
+                f"Buffer OB mungkin belum penuh. Contoh: {missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+            return
+
         X = df_final[self.predictor.selected_features]
+
+        # GUARD: cek tidak ada NaN/inf di fitur (data live belum matang).
+        # Kolom inter-round (past_*) memang NaN di awal sesi -> diperbolehkan
+        # (model di-train dgn invalidasi serupa). Sisanya WAJIB valid.
+        non_lag = [f for f in self.predictor.selected_features if not f.startswith('past_')]
+        bad = X[non_lag].replace([np.inf, -np.inf], np.nan).isna().any(axis=1).iloc[-1]
+        if bad:
+            nan_cols = X[non_lag].columns[X[non_lag].replace([np.inf, -np.inf], np.nan).isna().iloc[-1]].tolist()
+            logger.warning(
+                f"Status: SKIP (fitur mengandung NaN/inf, data live belum matang). "
+                f"Contoh: {nan_cols[:5]}{'...' if len(nan_cols) > 5 else ''}"
+            )
+            return
+
         p_model = self.predictor.predict_probability(X)[0]
         
         # --- MANUAL THRESHOLD FILTER ---
