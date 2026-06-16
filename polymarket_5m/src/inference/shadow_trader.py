@@ -304,6 +304,9 @@ class ShadowTrader:
                 df.set_index('timestamp', inplace=True)
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = df[col].astype(float)
+                # 'turnover' tidak dipakai sbg fitur & masih string -> buang
+                # supaya tidak menyebabkan error saat agregasi (.mean() pada str).
+                df = df.drop(columns=['turnover'], errors='ignore')
                 df = df.sort_index()
             else:
                 logger.error(f"Failed to fetch klines from Bybit: {resp.get('retMsg')}")
@@ -476,6 +479,9 @@ class ShadowTrader:
         # stay local because they depend on live round_history.
         df_1m = fe.add_technical_features_v1(self.buffer_1m)
         df_1m = fe.add_time_features_v1(df_1m)
+        # Defensif: training aggregate tidak filter numerik, jadi buang kolom
+        # non-numerik (mis. 'bids'/'asks'/'turnover' string) agar .mean() aman.
+        df_1m = df_1m.select_dtypes(include=[np.number])
         df_aggr = fe.aggregate_window_features_v1(df_1m.tail(15), self.config)
         df_final = self.add_inter_round_features_v1(df_aggr)
 
