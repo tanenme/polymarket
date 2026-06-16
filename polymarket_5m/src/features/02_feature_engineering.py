@@ -127,6 +127,67 @@ def compute_obi_v1(df_ob: pd.DataFrame) -> pd.DataFrame:
     obi = (b0_vol - a0_vol) / (b0_vol + a0_vol + 1e-9)
     return pd.DataFrame({'obi': obi}, index=df_ob.index)
 
+def compute_orderbook_features_v2(df_ob: pd.DataFrame) -> pd.DataFrame:
+    if df_ob.empty:
+        return pd.DataFrame(index=df_ob.index)
+
+    levels = (1, 5, 10, 20, 50)
+
+    def parse_side(raw, reverse=False):
+        try:
+            data = json.loads(raw)
+            parsed = [(float(price), float(size)) for price, size in data if float(size) > 0]
+            parsed.sort(key=lambda x: x[0], reverse=reverse)
+            return parsed
+        except Exception:
+            return []
+
+    rows = []
+    for bids_raw, asks_raw in zip(df_ob['bids'].values, df_ob['asks'].values):
+        bids = parse_side(bids_raw, reverse=True)
+        asks = parse_side(asks_raw, reverse=False)
+
+        if not bids or not asks:
+            rows.append({})
+            continue
+
+        bid_px, bid_qty = bids[0]
+        ask_px, ask_qty = asks[0]
+        mid = (bid_px + ask_px) / 2.0
+        spread = max(ask_px - bid_px, 0.0)
+        microprice = (ask_px * bid_qty + bid_px * ask_qty) / (bid_qty + ask_qty + 1e-9)
+
+        row = {
+            'spread_bps': spread / (mid + 1e-9) * 10000.0,
+            'queue_imb_l1': (bid_qty - ask_qty) / (bid_qty + ask_qty + 1e-9),
+            'microprice_dev_bps': (microprice - mid) / (mid + 1e-9) * 10000.0,
+        }
+
+        for level in levels:
+            b = bids[:level]
+            a = asks[:level]
+            b_depth = sum(q for _, q in b)
+            a_depth = sum(q for _, q in a)
+            row[f'depth_imb_l{level}'] = (b_depth - a_depth) / (b_depth + a_depth + 1e-9)
+            row[f'bid_depth_l{level}'] = b_depth
+            row[f'ask_depth_l{level}'] = a_depth
+            row[f'wall_bid_l{level}'] = max([q for _, q in b], default=0.0) / (b_depth + 1e-9)
+            row[f'wall_ask_l{level}'] = max([q for _, q in a], default=0.0) / (a_depth + 1e-9)
+
+        row['bid_depth_slope_l20'] = sum((mid - px) * q for px, q in bids[:20]) / (sum(q for _, q in bids[:20]) + 1e-9)
+        row['ask_depth_slope_l20'] = sum((px - mid) * q for px, q in asks[:20]) / (sum(q for _, q in asks[:20]) + 1e-9)
+        row['book_pressure_l20'] = row['depth_imb_l20'] / (row['spread_bps'] + 1e-6)
+        rows.append(row)
+
+    res = pd.DataFrame(rows, index=df_ob.index)
+    for level in (1, 5, 10, 20):
+        col = f'depth_imb_l{level}'
+        if col in res.columns:
+            res[f'mlofi_proxy_l{level}'] = res[col].diff().fillna(0.0)
+    if 'microprice_dev_bps' in res.columns:
+        res['microprice_dev_delta'] = res['microprice_dev_bps'].diff().fillna(0.0)
+    return res
+
 def compute_ofi_v1(df_ob: pd.DataFrame) -> pd.DataFrame:
     if df_ob.empty: return pd.DataFrame(columns=['ofi'])
     def parse_l1_data(x):
@@ -150,18 +211,87 @@ def compute_ofi_v1(df_ob: pd.DataFrame) -> pd.DataFrame:
     ofi_norm = ofi / (b_vol + a_vol + 1e-9)
     return pd.DataFrame({'ofi': ofi_norm}, index=df_ob.index)
 
+def compute_taker_flow_features_v2(df_tr: pd.DataFrame) -> pd.DataFrame:
+    if df_tr.empty:
+        return pd.DataFrame()
+
+    df = df_tr.copy()
+    df['qty'] = df['qty'].astype(float)
+    df['price'] = df['price'].astype(float)
+    if df['is_buyer_maker'].dtype == object:
+        df['is_buyer_maker'] = df['is_buyer_maker'].map({'True': True, 'False': False, True: True, False: False})
+
+    taker_buy = df['is_buyer_maker'] == False
+    df['notional'] = df['price'] * df['qty']
+    df['buy_qty'] = np.where(taker_buy, df['qty'], 0.0)
+    df['sell_qty'] = np.where(~taker_buy, df['qty'], 0.0)
+    df['buy_notional'] = np.where(taker_buy, df['notional'], 0.0)
+    df['sell_notional'] = np.where(~taker_buy, df['notional'], 0.0)
+    df['buy_count'] = taker_buy.astype(float)
+    df['sell_count'] = (~taker_buy).astype(float)
+
+    large_cut = df['notional'].quantile(0.95)
+    large = df['notional'] >= large_cut
+    df['large_buy_notional'] = np.where(taker_buy & large, df['notional'], 0.0)
+    df['large_sell_notional'] = np.where((~taker_buy) & large, df['notional'], 0.0)
+
+    grouped = df.resample('1min').agg({
+        'buy_qty': 'sum',
+        'sell_qty': 'sum',
+        'buy_notional': 'sum',
+        'sell_notional': 'sum',
+        'buy_count': 'sum',
+        'sell_count': 'sum',
+        'large_buy_notional': 'sum',
+        'large_sell_notional': 'sum',
+        'notional': 'sum',
+        'qty': 'sum',
+    })
+
+    res = pd.DataFrame(index=grouped.index)
+    total_qty = grouped['buy_qty'] + grouped['sell_qty']
+    total_notional = grouped['buy_notional'] + grouped['sell_notional']
+    total_count = grouped['buy_count'] + grouped['sell_count']
+    large_total = grouped['large_buy_notional'] + grouped['large_sell_notional']
+
+    res['taker_buy_ratio'] = grouped['buy_qty'] / (total_qty + 1e-9)
+    res['taker_signed_volume'] = (grouped['buy_qty'] - grouped['sell_qty']) / (total_qty + 1e-9)
+    res['taker_signed_notional'] = (grouped['buy_notional'] - grouped['sell_notional']) / (total_notional + 1e-9)
+    res['taker_count_imbalance'] = (grouped['buy_count'] - grouped['sell_count']) / (total_count + 1e-9)
+    res['large_trade_imbalance'] = (grouped['large_buy_notional'] - grouped['large_sell_notional']) / (large_total + 1e-9)
+    res['large_trade_share'] = large_total / (total_notional + 1e-9)
+    res['trade_intensity'] = total_count
+    res['notional_1m'] = total_notional
+    res['avg_trade_size'] = total_notional / (total_count + 1e-9)
+    res['taker_flow_accel'] = res['taker_signed_notional'].diff().fillna(0.0)
+    res['notional_zscore_1h'] = (
+        (res['notional_1m'] - res['notional_1m'].rolling(60, min_periods=15).mean())
+        / (res['notional_1m'].rolling(60, min_periods=15).std() + 1e-9)
+    )
+    return res
+
 def add_oi_features_v1(df_base: pd.DataFrame, df_oi: pd.DataFrame) -> pd.DataFrame:
     if df_oi.empty: return pd.DataFrame(index=df_base.index)
     oi_1m = df_oi.set_index('datetime')['openInterest'].reindex(df_base.index).ffill()
     res = pd.DataFrame(index=df_base.index)
     res['oi_change_15m'] = oi_1m.pct_change(15)
+    res['oi_change_5m'] = oi_1m.pct_change(5)
+    res['oi_change_1h'] = oi_1m.pct_change(60)
     res['oi_velocity'] = oi_1m.diff() / (oi_1m.shift(1) + 1e-9)
+    res['oi_acceleration'] = res['oi_velocity'].diff()
     res['oi_relative_std'] = oi_1m.rolling(15).std() / (oi_1m.rolling(15).mean() + 1e-9)
     oi_ma_1h = oi_1m.rolling(60).mean()
     res['oi_momentum'] = (oi_1m - oi_ma_1h) / (oi_ma_1h + 1e-9)
+    res['oi_zscore_24h'] = (oi_1m - oi_1m.rolling(1440, min_periods=240).mean()) / (oi_1m.rolling(1440, min_periods=240).std() + 1e-9)
     if 'close' in df_base.columns:
         price_change = df_base['close'].pct_change(1)
         res['oi_price_interaction'] = price_change * res['oi_velocity']
+        price_change_15m = df_base['close'].pct_change(15)
+        res['price_up_oi_up'] = ((price_change_15m > 0) & (res['oi_change_15m'] > 0)).astype(float)
+        res['price_down_oi_up'] = ((price_change_15m < 0) & (res['oi_change_15m'] > 0)).astype(float)
+        res['price_up_oi_down'] = ((price_change_15m > 0) & (res['oi_change_15m'] < 0)).astype(float)
+        res['price_down_oi_down'] = ((price_change_15m < 0) & (res['oi_change_15m'] < 0)).astype(float)
+        res['oi_price_divergence'] = np.sign(res['oi_change_15m']) * -np.sign(price_change_15m)
     return res
 
 def aggregate_window_features_v1(df_full: pd.DataFrame, config: dict) -> pd.DataFrame:
@@ -236,10 +366,12 @@ def process_day_features(day, config, day_index):
         try:
             df_ob = pd.read_parquet(ob_path)
             df_ob['timestamp'] = pd.to_datetime(df_ob['timestamp_ms'], unit='ms')
-            df_ob = df_ob.set_index('timestamp')
+            df_ob = df_ob.set_index('timestamp').sort_index()
+            df_ob = df_ob.resample('5s').last().dropna(subset=['bids', 'asks'])
+            df_lob = compute_orderbook_features_v2(df_ob)
             df_obi = compute_obi_v1(df_ob)
             df_ofi = compute_ofi_v1(df_ob)
-            micro_ob = pd.concat([df_obi, df_ofi], axis=1).resample('1min').agg(['mean', 'std'])
+            micro_ob = pd.concat([df_lob, df_obi, df_ofi], axis=1).resample('1min').agg(['mean', 'std', 'last'])
             micro_ob.columns = [f"{c[0]}_{c[1]}" for c in micro_ob.columns]
             day_micro = day_micro.join(micro_ob, how='left')
         except Exception as e:
@@ -250,8 +382,10 @@ def process_day_features(day, config, day_index):
             df_tr['timestamp'] = pd.to_datetime(df_tr['timestamp'], unit='ms')
             df_tr = df_tr.set_index('timestamp')
             df_vpin = compute_vpin_correct(df_tr)
+            df_taker = compute_taker_flow_features_v2(df_tr)
             micro_tr = df_vpin.resample('1min').agg(['mean', 'std'])
             micro_tr.columns = [f"{c[0]}_{c[1]}" for c in micro_tr.columns]
+            micro_tr = micro_tr.join(df_taker, how='outer')
             day_micro = day_micro.join(micro_tr, how='left')
         except Exception as e:
             logger.error(f"Error processing Trades for {day_str}: {e}")

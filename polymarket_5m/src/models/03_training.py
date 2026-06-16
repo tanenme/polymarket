@@ -15,6 +15,7 @@ from datetime import datetime
 
 # Local imports
 from regime_detector import RegimeDetector
+from calibrators import IdentityCalibrator, PlattCalibrator
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -66,13 +67,34 @@ def load_and_validate_data_v1(features_path: str, config: dict) -> pd.DataFrame:
 def is_valid_feature(col_name: str, config: dict) -> bool:
     exclude = config['features']['exclude_cols']
     price_abs = set(config['features']['price_absolute_cols'])
+    aggregate_prefixes = ('win_mean_', 'win_std_', 'win_trend_', 'snap_')
+    absolute_derived = {'vwap_rolling_60'}
+    absolute_liquidity_markers = (
+        'bid_depth_l',
+        'ask_depth_l',
+        'notional_1m',
+        'avg_trade_size',
+        'trade_intensity',
+    )
     
     # Check if col_name starts with any string in exclude list
     if any(col_name.startswith(ex) for ex in exclude):
         return False
         
-    if col_name in price_abs: return False
-    if col_name.startswith('snap_') and any(p in col_name for p in price_abs): return False
+    if col_name in price_abs or col_name in absolute_derived:
+        return False
+
+    for prefix in aggregate_prefixes:
+        if col_name.startswith(prefix):
+            base_name = col_name[len(prefix):]
+            if base_name in price_abs or base_name in absolute_derived:
+                return False
+            if any(marker in base_name for marker in absolute_liquidity_markers):
+                return False
+            break
+
+    if any(marker in col_name for marker in absolute_liquidity_markers):
+        return False
     
     return True
 
@@ -119,8 +141,6 @@ def optimize_catboost(X_train, y_train, X_val, y_val, w_train, config):
             'iterations': cb_cfg['iterations_per_trial'],
             'early_stopping_rounds': cb_cfg['early_stopping_per_trial'],
             'task_type': cb_cfg['task_type'],
-            'devices': cb_cfg['devices'],
-            'gpu_ram_part': cb_cfg['gpu_ram_part'],
             'max_bin': trial.suggest_int('max_bin', *cb_cfg['optuna_search_space']['max_bin']),
             'bootstrap_type': cb_cfg['bootstrap_type'],
             'loss_function': cb_cfg['loss_function'],
@@ -135,6 +155,9 @@ def optimize_catboost(X_train, y_train, X_val, y_val, w_train, config):
             'max_ctr_complexity': 1, # Limit feature interaction complexity to reduce overfitting
             'verbose': False
         }
+        if cb_cfg.get('task_type') == 'GPU':
+            params['devices'] = cb_cfg['devices']
+            params['gpu_ram_part'] = cb_cfg['gpu_ram_part']
         
         model = cb.CatBoostClassifier(**params)
         model.fit(X_train, y_train, sample_weight=w_train, eval_set=(X_val, y_val), use_best_model=True)
@@ -163,8 +186,6 @@ def train_final_models(X_train, y_train, X_val, y_val, w_train, best_params_cb, 
         'iterations': cb_cfg['iterations_final'],
         'early_stopping_rounds': cb_cfg['early_stopping_final'],
         'task_type': cb_cfg['task_type'],
-        'devices': cb_cfg['devices'],
-        'gpu_ram_part': cb_cfg['gpu_ram_part'],
         'bootstrap_type': cb_cfg['bootstrap_type'],
         'loss_function': cb_cfg['loss_function'],
         'eval_metric': cb_cfg['eval_metric'],
@@ -173,6 +194,9 @@ def train_final_models(X_train, y_train, X_val, y_val, w_train, best_params_cb, 
         **best_params_cb,
         'verbose': 500
     }
+    if cb_cfg.get('task_type') == 'GPU':
+        cb_params['devices'] = cb_cfg['devices']
+        cb_params['gpu_ram_part'] = cb_cfg['gpu_ram_part']
     
     cb_model = cb.CatBoostClassifier(**cb_params)
     cb_model.fit(X_train, y_train, sample_weight=w_train, eval_set=(X_val, y_val), use_best_model=True)
@@ -193,17 +217,26 @@ def calibrate_and_threshold(cb_model, lgb_model, X_val, y_val, config):
     p_cb = cb_model.predict_proba(X_val)[:, 1]
     p_lgb = lgb_model.predict_proba(X_val)[:, 1]
     
-    # Ensemble weights based on AUC
-    auc_cb = roc_auc_score(y_val, p_cb)
-    auc_lgb = roc_auc_score(y_val, p_lgb)
-    
-    w_cb = auc_cb**2 / (auc_cb**2 + auc_lgb**2)
+    # Ensemble weight chosen on validation ranking quality. This can select a
+    # single model when the other model adds variance instead of signal.
+    best_auc, w_cb = -np.inf, 0.5
+    for candidate_w in np.linspace(0.0, 1.0, 21):
+        p_candidate = p_cb * candidate_w + p_lgb * (1.0 - candidate_w)
+        auc = roc_auc_score(y_val, p_candidate)
+        if auc > best_auc:
+            best_auc, w_cb = auc, candidate_w
     w_lgb = 1 - w_cb
     
     p_ens = p_cb * w_cb + p_lgb * w_lgb
     
     # Calibrator
-    calibrator = IsotonicRegression(out_of_bounds='clip')
+    method = config['evaluation'].get('calibration_method', 'isotonic')
+    if method == 'identity':
+        calibrator = IdentityCalibrator()
+    elif method == 'sigmoid':
+        calibrator = PlattCalibrator()
+    else:
+        calibrator = IsotonicRegression(out_of_bounds='clip')
     calibrator.fit(p_ens, y_val)
     
     # Threshold search

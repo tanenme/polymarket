@@ -149,13 +149,18 @@ def walk_forward_validation_v1(df: pd.DataFrame, feature_cols: list, config: dic
         y_va = df.iloc[val_start:val_end]['target'].astype(np.int8)
 
         # Quick training
-        model = cb.CatBoostClassifier(
-            iterations=1000, depth=4, learning_rate=0.01,
-            task_type='GPU', gpu_ram_part=0.40,
-            bootstrap_type='Bernoulli', loss_function='Logloss',
-            eval_metric='AUC', early_stopping_rounds=50,
-            verbose=False, random_seed=42
-        )
+        cb_cfg = config['training']['catboost']
+        params = {
+            'iterations': 1000, 'depth': 4, 'learning_rate': 0.01,
+            'task_type': cb_cfg.get('task_type', 'GPU'),
+            'bootstrap_type': 'Bernoulli', 'loss_function': 'Logloss',
+            'eval_metric': 'AUC', 'early_stopping_rounds': 50,
+            'verbose': False, 'random_seed': 42
+        }
+        if params['task_type'] == 'GPU':
+            params['gpu_ram_part'] = cb_cfg.get('gpu_ram_part', 0.40)
+            params['devices'] = cb_cfg.get('devices', '0')
+        model = cb.CatBoostClassifier(**params)
         model.fit(X_tr, y_tr, eval_set=(X_va, y_va), use_best_model=True)
 
         p_va = model.predict_proba(X_va)[:, 1]

@@ -48,20 +48,23 @@ def run_backtest_v1(config_path: str = None):
     # 2. Generate Probabilities
     test_df['p_model'] = predictor.predict_probability(test_df)
     
-    # 3. Simulate Market Price (Approximation)
+    # 3. Simulate Market Price (REALISTIC: Polymarket near-efficient)
+    # Harga market = base rate (~50%) + noise acak yang TIDAK tahu outcome.
+    # Edge murni datang dari akurasi model, bukan dari harga ekstrem.
     np.random.seed(42)
-    test_df['p_market'] = 0.5 + np.random.normal(0, 0.02, len(test_df))
-    test_df['p_market'] = test_df['p_market'].clip(0.1, 0.9)
+    base_rate = test_df['target'].mean()  # ~0.50
+    noise = np.random.normal(0, 0.05, len(test_df))
+    test_df['p_market'] = (base_rate + noise).clip(0.15, 0.85)
 
     # 4. Trading Simulation
     initial_bankroll = config['trade_decision']['initial_bankroll']
     bankroll = initial_bankroll
     equity_curve = [initial_bankroll]
     trades = []
-    
+
     for idx, row in test_df.iterrows():
-        # Simulate Spread (1.5% - 3.5%)
-        spread = np.random.uniform(0.015, 0.035)
+        # Simulate Spread (2% - 4%, realistis untuk market 15m likuiditas sedang)
+        spread = np.random.uniform(0.02, 0.04)
         p_market_mid = row['p_market']
         best_bid = p_market_mid - spread/2
         best_ask = p_market_mid + spread/2

@@ -45,8 +45,15 @@ class ShadowTrader:
         reports_path = PROJECT_ROOT / reports_rel
         reports_path.mkdir(parents=True, exist_ok=True)
         
-        self.shadow_log_path = reports_path / "shadow_trades.csv"
-        self.bankroll_path = reports_path / "shadow_bankroll.json"
+        # Suffix for files based on threshold and test mode
+        suffix = ""
+        if self.forced_threshold is not None:
+            suffix += f"_t{self.forced_threshold}"
+        if self.test_mode:
+            suffix += "_test"
+            
+        self.shadow_log_path = reports_path / f"shadow_trades{suffix}.csv"
+        self.bankroll_path = reports_path / f"shadow_bankroll{suffix}.json"
         
         self.buffer_1m = pd.DataFrame()
         self.round_history = pd.DataFrame()
