@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import requests
+import urllib3
 import yaml
 import time
 import logging
@@ -12,6 +13,10 @@ import threading
 import importlib.util
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
+
+# Suppress InsecureRequestWarning: VPN melakukan SSL inspection (self-signed cert)
+# sehingga verify=True selalu gagal. verify=False aman untuk Bybit public API.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Local imports
 from inference_v1 import PolymarketPredictor
@@ -272,7 +277,7 @@ class ShadowTrader:
         url = "https://api.bybit.com/v5/market/orderbook"
         params = {"category": "spot", "symbol": "BTCUSDT", "limit": 50}
         try:
-            resp = requests.get(url, params=params, timeout=2).json()
+            resp = requests.get(url, params=params, timeout=2, verify=False).json()
             if resp.get('retCode') == 0:
                 res = resp['result']
                 # Bybit returns [["price","qty"], ...]; training parquet stores
@@ -296,7 +301,7 @@ class ShadowTrader:
         klines_url = "https://api.bybit.com/v5/market/kline"
         params = {"category": "spot", "symbol": "BTCUSDT", "interval": "1", "limit": 300}
         try:
-            resp = requests.get(klines_url, params=params, timeout=10).json()
+            resp = requests.get(klines_url, params=params, timeout=10, verify=False).json()
             if resp.get('retCode') == 0:
                 klines_list = resp['result']['list']
                 df = pd.DataFrame(klines_list, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -319,7 +324,7 @@ class ShadowTrader:
         oi_url = "https://api.bybit.com/v5/market/open-interest"
         params = {"category": "linear", "symbol": "BTCUSDT", "intervalTime": "5min", "limit": 200}
         try:
-            resp = requests.get(oi_url, params=params, timeout=10).json()
+            resp = requests.get(oi_url, params=params, timeout=10, verify=False).json()
             if resp.get('retCode') == 0:
                 oi_list = resp['result']['list']
                 oi_df = pd.DataFrame(oi_list)
@@ -340,7 +345,7 @@ class ShadowTrader:
         trades_url = "https://api.bybit.com/v5/market/recent-trade"
         params = {"category": "spot", "symbol": "BTCUSDT", "limit": 1000}
         try:
-            resp = requests.get(trades_url, params=params, timeout=10).json()
+            resp = requests.get(trades_url, params=params, timeout=10, verify=False).json()
             if resp.get('retCode') == 0:
                 trades_list = resp['result']['list']
                 tr_df = pd.DataFrame(trades_list)
@@ -435,7 +440,8 @@ class ShadowTrader:
         # GUARD: pastikan buffer OB sudah cukup terisi sebelum prediksi.
         # Window fitur = 15 menit. OB @200ms idealnya ~4500 snapshot/15m.
         # Minimal 12 menit data (~3600 snapshot) agar fitur OB stabil & valid.
-        MIN_OB_SNAPSHOTS = 3600
+        # Test mode: turunkan ke 30 snap (~6 detik) agar langsung bisa prediksi.
+        MIN_OB_SNAPSHOTS = 30 if self.test_mode else 3600
         with self.ob_lock:
             ob_count = len(self.ob_collector_buffer)
         if ob_count < MIN_OB_SNAPSHOTS:
@@ -503,8 +509,45 @@ class ShadowTrader:
         # NaN supaya model memperlakukannya sebagai missing, bukan nilai rusak.
         X = X.replace([np.inf, -np.inf], np.nan)
 
+        # ===== DIAGNOSTIC LOG — FEATURE READINESS =====
+        _nan_mask  = X.isna().any(axis=0)
+        _n_nan     = int(_nan_mask.sum())
+        _n_total   = len(self.predictor.selected_features)
+        # NaN per category (keyword match)
+        _kw = lambda kws: sum(1 for f in X.columns if _nan_mask.get(f, False) and any(k in f for k in kws))
+        _nan_ob    = _kw(['obi','ofi','depth','lob','spread','imbalance','microprice','mlofi'])
+        _nan_taker = _kw(['taker','vpin','buy_ratio','sell_ratio'])
+        _nan_past  = _kw(['past_'])
+        _nan_tech  = max(0, _n_nan - _nan_ob - _nan_taker - _nan_past)
+        # Zero-filled OB features (filled=0 means OB pipeline returned empty)
+        _ob_cols   = [f for f in X.columns if any(k in f for k in ['obi','ofi','depth','lob','spread','imbalance','microprice','mlofi'])]
+        _row       = X.iloc[-1]
+        _ob_zeros  = sum(1 for f in _ob_cols if not pd.isna(_row.get(f, np.nan)) and float(_row.get(f, 1)) == 0.0)
+        # Sample 5 key feature values to detect if input is changing round-to-round
+        _sample = [f for f in ['win_mean_log_ret','win_mean_rsi_14','win_mean_taker_buy_ratio',
+                                'snap_log_ret','past_ret_lag1','past_ret_sum_4'] if f in X.columns][:5]
+        _feat_str = " | ".join(
+            f"{f}={_row[f]:.4f}" if not pd.isna(_row[f]) else f"{f}=NaN"
+            for f in _sample
+        )
+        logger.info(f"[DIAG] Data: {len(self.buffer_1m)}×1m klines | OB buffer: {ob_count} snap | Round history: {len(self.round_history)} rounds")
+        logger.info(f"[DIAG] Fitur NaN: {_n_nan}/{_n_total} total | OB:{_nan_ob} Taker:{_nan_taker} Past:{_nan_past} Tech:{_nan_tech}")
+        if _ob_cols:
+            logger.info(f"[DIAG] OB features: {len(_ob_cols)} kolom | zero-filled: {_ob_zeros} (0=pipeline kosong)")
+        if _feat_str:
+            logger.info(f"[DIAG] Sampel nilai (harusnya berubah tiap round): {_feat_str}")
+        # ===== END DIAGNOSTIC =====
+
         p_model = self.predictor.predict_probability(X)[0]
-        
+
+        # Breakdown raw model untuk diagnosa probabilitas berulang
+        _X_sub = X[self.predictor.selected_features].astype(np.float32)
+        _p_cb  = float(self.predictor.cb_model.predict_proba(_X_sub)[:, 1][0])
+        _p_lgb = float(self.predictor.lgb_model.predict_proba(_X_sub)[:, 1][0])
+        _w_cb, _w_lgb = self.predictor.ensemble_weights
+        _p_ens = _p_cb * _w_cb + _p_lgb * _w_lgb
+        logger.info(f"[DIAG] CB:{_p_cb:.4f} | LGBM:{_p_lgb:.4f} | Ens:{_p_ens:.4f} | Cal:{p_model:.4f} | w=[{_w_cb:.2f}/{_w_lgb:.2f}]")
+
         # --- MANUAL THRESHOLD FILTER ---
         confidence = max(p_model, 1 - p_model)
         if self.forced_threshold and confidence < self.forced_threshold:
@@ -578,7 +621,7 @@ class ShadowTrader:
             # Bybit V5 Tickers
             ticker_url = "https://api.bybit.com/v5/market/tickers"
             params = {"category": "spot", "symbol": "BTCUSDT"}
-            resp = requests.get(ticker_url, params=params, timeout=10).json()
+            resp = requests.get(ticker_url, params=params, timeout=10, verify=False).json()
             if resp.get('retCode') == 0:
                 curr_p = float(resp['result']['list'][0]['lastPrice'])
             else:

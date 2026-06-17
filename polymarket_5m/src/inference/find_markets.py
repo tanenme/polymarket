@@ -5,7 +5,11 @@ Uses Tag-based discovery for high precision.
 
 from __future__ import annotations
 import requests
+import urllib3
 import logging
+
+# Suppress InsecureRequestWarning (VPN SSL inspection)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -29,7 +33,7 @@ class PolymarketMarketFinder:
         try:
             # Step 1: Get active markets by Tag
             url = f"{cls.GAMMA_URL}/markets?active=true&tag_id={cls.TAG_15M}&limit=100"
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=10, verify=False)
             
             if resp.status_code != 200:
                 logger.error(f"Gamma API error: {resp.status_code}")
@@ -54,7 +58,7 @@ class PolymarketMarketFinder:
                     
                     # Step 2: Check live Order Book for liquidity
                     book_url = f"{cls.CLOB_URL}/book?token_id={yes_token}"
-                    book_resp = requests.get(book_url, timeout=5)
+                    book_resp = requests.get(book_url, timeout=5, verify=False)
                     
                     if book_resp.status_code == 200:
                         book = book_resp.json()
